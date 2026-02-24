@@ -14,6 +14,15 @@
   <img src=".github/images/image-3.png" width="295" alt="Add New Account" />
 </p>
 
+<p align="center">
+  <strong>▶ Demo Video </strong><br>
+  <a href="https://www.youtube.com/watch?v=lXTgJzjNmws">
+    <img src="https://img.youtube.com/vi/lXTgJzjNmws/maxresdefault.jpg" width="600" alt="Demo Video" />
+  </a>
+  <br>
+  <sub>Click the image to watch the full demo on YouTube</sub>
+</p>
+
 ---
 
 ## Desktop App

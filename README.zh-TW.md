@@ -14,6 +14,15 @@
   <img src=".github/images/image-3.png" width="295" alt="新增帳號" />
 </p>
 
+<p align="center">
+  <strong>▶ 操作示範影片</strong><br>
+  <a href="https://www.youtube.com/watch?v=lXTgJzjNmws">
+    <img src="https://img.youtube.com/vi/lXTgJzjNmws/maxresdefault.jpg" width="600" alt="操作示範影片" />
+  </a>
+  <br>
+  <sub>點擊圖片前往 YouTube 觀看完整示範</sub>
+</p>
+
 ---
 
 ## 桌面應用
