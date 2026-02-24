@@ -1,5 +1,5 @@
 use c_switcher_lib::{
-    get_usage, list_profiles, switch_profile, ProfileEntry, UsageResult,
+    get_usage_impl, list_profiles_impl, switch_profile_impl, ProfileEntry, UsageResult,
 };
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -87,7 +87,7 @@ struct ProfileUsage {
     email: String,
     organization: String,
     five_hour_pct: f64,
-    daily_pct: f64,
+    seven_day_pct: f64,
     monthly_pct: f64,
     error: Option<String>,
 }
@@ -100,7 +100,7 @@ async fn fetch_all_usage(profiles: &[ProfileEntry]) -> Vec<ProfileUsage> {
         let email = p.email.clone();
         let organization = p.organization.clone();
         set.spawn(async move {
-            let result = get_usage(Some(name.clone())).await;
+            let result = get_usage_impl(Some(name.clone())).await;
             parse_usage_result(&name, &email, &organization, result)
         });
     }
@@ -115,7 +115,7 @@ async fn fetch_all_usage(profiles: &[ProfileEntry]) -> Vec<ProfileUsage> {
                     email: "?".into(),
                     organization: String::new(),
                     five_hour_pct: 999.0,
-                    daily_pct: 999.0,
+                    seven_day_pct: 999.0,
                     monthly_pct: 999.0,
                     error: Some(format!("join error: {}", e)),
                 });
@@ -150,7 +150,7 @@ fn parse_usage_result(
             email: email.to_string(),
             organization: organization.to_string(),
             five_hour_pct: 999.0,
-            daily_pct: 999.0,
+            seven_day_pct: 999.0,
             monthly_pct: 999.0,
             error: result.error,
         };
@@ -164,7 +164,7 @@ fn parse_usage_result(
                 email: email.to_string(),
                 organization: organization.to_string(),
                 five_hour_pct: 999.0,
-                daily_pct: 999.0,
+                seven_day_pct: 999.0,
                 monthly_pct: 999.0,
                 error: Some("no data".into()),
             };
@@ -175,29 +175,25 @@ fn parse_usage_result(
         .get("five_hour")
         .and_then(|v| v.get("utilization"))
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.0)
-        * 100.0;
+        .unwrap_or(0.0);
 
-    let daily_pct = data
-        .get("daily")
+    let seven_day_pct = data
+        .get("seven_day")
         .and_then(|v| v.get("utilization"))
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.0)
-        * 100.0;
+        .unwrap_or(0.0);
 
     let monthly_pct = data
-        .get("monthly")
-        .and_then(|v| v.get("utilization"))
+        .get("utilization")
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.0)
-        * 100.0;
+        .unwrap_or(0.0);
 
     ProfileUsage {
         name: name.to_string(),
         email: email.to_string(),
         organization: organization.to_string(),
         five_hour_pct,
-        daily_pct,
+        seven_day_pct,
         monthly_pct,
         error: None,
     }
@@ -219,12 +215,12 @@ fn color_for_pct(pct: f64) -> &'static str {
 
 fn print_usage_table(usages: &[ProfileUsage]) {
     eprintln!(
-        "\n{}{}  #  Profile          Email                          Org                5h%      Daily%   Monthly%{}",
-        BOLD, DIM, RESET
+        "\n{}{}  {:>2}  {:<16}  {:<30}  {:<18}  {:>7}  {:>7}{}",
+        BOLD, DIM, "#", "Profile", "Email", "Org", "5h%", "7d%", RESET
     );
     eprintln!(
-        "{}  ── ──────────────── ────────────────────────────── ────────────────── ──────── ──────── ────────{}",
-        DIM, RESET
+        "{}  {:─>2}  {:─>16}  {:─>30}  {:─>18}  {:─>7}  {:─>7}{}",
+        DIM, "", "", "", "", "", "", RESET
     );
 
     for (i, u) in usages.iter().enumerate() {
@@ -240,15 +236,13 @@ fn print_usage_table(usages: &[ProfileUsage]) {
             );
         } else {
             let c5 = color_for_pct(u.five_hour_pct);
-            let cd = color_for_pct(u.daily_pct);
-            let cm = color_for_pct(u.monthly_pct);
+            let c7 = color_for_pct(u.seven_day_pct);
             eprintln!(
-                "  {}{:>2}{}  {:<16}  {:<30}  {:<18}  {}{:>6.1}%{}  {}{:>6.1}%{}  {}{:>6.1}%{}",
+                "  {}{:>2}{}  {:<16}  {:<30}  {:<18}  {}{:>6.1}%{}  {}{:>6.1}%{}",
                 DIM, idx, RESET,
                 name, email, org,
                 c5, u.five_hour_pct, RESET,
-                cd, u.daily_pct, RESET,
-                cm, u.monthly_pct, RESET,
+                c7, u.seven_day_pct, RESET,
             );
         }
     }
@@ -287,7 +281,7 @@ async fn switch_and_exec(profile_name: &str, claude_args: &[String]) -> ! {
         DIM, RESET, BOLD, profile_name
     );
 
-    let result = switch_profile(profile_name.to_string()).await;
+    let result = switch_profile_impl(profile_name.to_string()).await;
     if !result.success {
         let err = result.error.unwrap_or_else(|| "unknown error".into());
         eprintln!("{}Switch failed: {}{}", RED, err, RESET);
@@ -311,7 +305,7 @@ async fn main() {
     let args = parse_args();
 
     // Fetch profiles
-    let profiles = list_profiles().await;
+    let profiles = list_profiles_impl().await;
     if profiles.is_empty() {
         eprintln!(
             "{}No profiles found. Use the Tauri app to backup profiles first.{}",

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Claude Code Auth Token Switcher"
 authors = ["wangejay"]
 edition = "2021"
+default-run = "c-switcher"
 
 [lib]
 name = "c_switcher_lib"

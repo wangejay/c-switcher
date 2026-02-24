@@ -709,6 +709,11 @@ pub async fn get_usage_impl(profile_name: Option<String>) -> UsageResult {
     }
 }
 
+#[tauri::command]
+async fn get_usage(profile_name: Option<String>) -> UsageResult {
+    get_usage_impl(profile_name).await
+}
+
 /// Minimal timestamp formatting without pulling in chrono crate
 fn chrono_minimal_format(epoch_secs: i64) -> String {
     // Use the `date` command on macOS for formatting
