@@ -26,10 +26,6 @@ A native macOS app (built with Tauri) for managing Claude Code OAuth profiles.
 - **Token refresh** — renew expired OAuth tokens without re-login
 - **Guided setup** — add new accounts with a step-by-step flow
 
-```bash
-npm install && npm run tauri build
-```
-
 ---
 
 ## `csw` CLI
@@ -96,6 +92,28 @@ csw -- --resume               # auto-select + pass flags to claude
 ```bash
 npm run tauri dev
 ```
+
+## Build
+
+```bash
+npm install && npm run tauri build
+```
+
+The built `.dmg` will be in `src-tauri/target/release/bundle/dmg/`.
+
+Alternatively, push a version tag to trigger CI/CD and get all platform artifacts automatically:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+GitHub Actions will build and publish to [Releases](../../releases):
+- `C-Switcher-macos-universal.dmg`
+- `C-Switcher-windows-x64.msi`
+- `C-Switcher-windows-x64-setup.exe`
+- `csw-macos-arm64`
+- `csw-macos-x86_64`
 
 ## License
 
