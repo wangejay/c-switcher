@@ -1,5 +1,6 @@
 use c_switcher_lib::{
-    get_usage_impl, list_profiles_impl, switch_profile_impl, ProfileEntry, UsageResult,
+    get_usage_impl, list_profiles_impl, read_oauth_account, refresh_token_impl,
+    switch_profile_impl, ProfileEntry, UsageResult,
 };
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -90,6 +91,57 @@ struct ProfileUsage {
     seven_day_pct: f64,
     monthly_pct: f64,
     error: Option<String>,
+}
+
+/// Refresh expired tokens for non-active profiles (skip the active account).
+async fn refresh_expired_profiles(profiles: &[ProfileEntry]) {
+    // Determine the active account's email+uuid to skip it
+    let active_email = read_oauth_account()
+        .ok()
+        .map(|o| o.email_address)
+        .unwrap_or_default();
+
+    let expired: Vec<&ProfileEntry> = profiles
+        .iter()
+        .filter(|p| p.is_expired && p.email != active_email)
+        .collect();
+
+    if expired.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "{}Refreshing {} expired profile(s)...{}",
+        DIM,
+        expired.len(),
+        RESET
+    );
+
+    let mut set = JoinSet::new();
+    for p in &expired {
+        let name = p.name.clone();
+        set.spawn(async move {
+            let result = refresh_token_impl(Some(name.clone())).await;
+            (name, result)
+        });
+    }
+
+    while let Some(result) = set.join_next().await {
+        match result {
+            Ok((name, op)) => {
+                if op.success {
+                    eprintln!("  {}✓ {} refreshed{}", GREEN, name, RESET);
+                } else {
+                    let err = op.error.unwrap_or_else(|| "unknown".into());
+                    eprintln!("  {}✗ {} refresh failed: {}{}", RED, name, err, RESET);
+                }
+            }
+            Err(e) => {
+                eprintln!("  {}✗ join error: {}{}", RED, e, RESET);
+            }
+        }
+    }
+    eprintln!();
 }
 
 async fn fetch_all_usage(profiles: &[ProfileEntry]) -> Vec<ProfileUsage> {
@@ -313,6 +365,12 @@ async fn main() {
         );
         std::process::exit(1);
     }
+
+    // Auto-refresh expired non-active profiles
+    refresh_expired_profiles(&profiles).await;
+
+    // Re-list profiles to pick up refreshed tokens
+    let profiles = list_profiles_impl().await;
 
     // Fetch usage for all profiles in parallel
     eprintln!("{}Fetching usage for {} profiles...{}", DIM, profiles.len(), RESET);

@@ -451,8 +451,7 @@ async fn delete_profile(name: String) -> OpResult {
     }
 }
 
-#[tauri::command]
-async fn refresh_token(profile_name: Option<String>) -> OpResult {
+pub async fn refresh_token_impl(profile_name: Option<String>) -> OpResult {
     // Get the token JSON string
     let (token_str, profile_path) = if let Some(ref pname) = profile_name {
         let path = profiles_dir().join(format!("{}.json", pname));
@@ -592,6 +591,11 @@ async fn refresh_token(profile_name: Option<String>) -> OpResult {
         ));
     }
     r
+}
+
+#[tauri::command]
+async fn refresh_token(profile_name: Option<String>) -> OpResult {
+    refresh_token_impl(profile_name).await
 }
 
 #[derive(Serialize)]
