@@ -33,12 +33,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch version in Cargo.toml, tauri.conf.json, package.json
+      - name: Patch version & remove csw binary entry
         run: |
           VERSION="${{ needs.create-release.outputs.version }}"
           sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
           sed -i '' "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
           sed -i '' "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" package.json
+          sed -i '' '/^\[\[bin\]\]/,/^$/d' src-tauri/Cargo.toml
 
       - uses: actions/setup-node@v4
         with:
@@ -73,13 +74,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch version in Cargo.toml, tauri.conf.json, package.json
+      - name: Patch version & remove csw binary entry
         shell: pwsh
         run: |
           $VERSION = "${{ needs.create-release.outputs.version }}"
           (Get-Content src-tauri/Cargo.toml) -replace '^version = ".*"', "version = `"$VERSION`"" | Set-Content src-tauri/Cargo.toml
           (Get-Content src-tauri/tauri.conf.json -Raw) -replace '"version": ".*?"', "`"version`": `"$VERSION`"" | Set-Content src-tauri/tauri.conf.json
           (Get-Content package.json -Raw) -replace '"version": ".*?"', "`"version`": `"$VERSION`"" | Set-Content package.json
+          (Get-Content src-tauri/Cargo.toml -Raw) -replace '(?s)\[\[bin\]\]\r?\nname = "csw"\r?\npath = "src/bin/csw.rs"\r?\n', '' | Set-Content src-tauri/Cargo.toml
 
       - uses: actions/setup-node@v4
         with:
