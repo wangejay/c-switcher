@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # ── 1. Create draft release & extract version ──
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: meta
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
+
+  # ── 2. Build Tauri app — macOS universal ──
+  build-tauri-macos:
+    needs: create-release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch version in Cargo.toml, tauri.conf.json, package.json
+        run: |
+          VERSION="${{ needs.create-release.outputs.version }}"
+          sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+          sed -i '' "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
+          sed -i '' "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install Rust stable + targets
+        run: |
+          rustup update stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build Tauri (universal)
+        run: npm run tauri build -- --target universal-apple-darwin
+
+      - name: Upload DMG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DMG=$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
+          gh release upload "$GITHUB_REF_NAME" "$DMG#C-Switcher-macos-universal.dmg"
+
+  # ── 3. Build Tauri app — Windows x64 ──
+  build-tauri-windows:
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch version in Cargo.toml, tauri.conf.json, package.json
+        shell: pwsh
+        run: |
+          $VERSION = "${{ needs.create-release.outputs.version }}"
+          (Get-Content src-tauri/Cargo.toml) -replace '^version = ".*"', "version = `"$VERSION`"" | Set-Content src-tauri/Cargo.toml
+          (Get-Content src-tauri/tauri.conf.json -Raw) -replace '"version": ".*?"', "`"version`": `"$VERSION`"" | Set-Content src-tauri/tauri.conf.json
+          (Get-Content package.json -Raw) -replace '"version": ".*?"', "`"version`": `"$VERSION`"" | Set-Content package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install Rust stable
+        run: rustup update stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build Tauri
+        run: npm run tauri build
+
+      - name: Upload MSI & Setup EXE
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $msi = Get-ChildItem -Path src-tauri/target/release/bundle/msi -Filter *.msi | Select-Object -First 1
+          $exe = Get-ChildItem -Path src-tauri/target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
+          gh release upload "$env:GITHUB_REF_NAME" "$($msi.FullName)#C-Switcher-windows-x64.msi"
+          gh release upload "$env:GITHUB_REF_NAME" "$($exe.FullName)#C-Switcher-windows-x64-setup.exe"
+
+  # ── 4. Build CLI — macOS (arm64 + x86_64) ──
+  build-cli-macos:
+    needs: create-release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch version in Cargo.toml
+        run: |
+          VERSION="${{ needs.create-release.outputs.version }}"
+          sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+
+      - name: Install Rust stable + targets
+        run: |
+          rustup update stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build CLI (arm64)
+        run: cargo build --release --bin csw --target aarch64-apple-darwin --manifest-path src-tauri/Cargo.toml
+
+      - name: Build CLI (x86_64)
+        run: cargo build --release --bin csw --target x86_64-apple-darwin --manifest-path src-tauri/Cargo.toml
+
+      - name: Upload CLI binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp src-tauri/target/aarch64-apple-darwin/release/csw csw-macos-arm64
+          cp src-tauri/target/x86_64-apple-darwin/release/csw csw-macos-x86_64
+          gh release upload "$GITHUB_REF_NAME" csw-macos-arm64 csw-macos-x86_64
+
+  # ── 5. Publish release (remove draft) ──
+  publish-release:
+    needs: [build-tauri-macos, build-tauri-windows, build-cli-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

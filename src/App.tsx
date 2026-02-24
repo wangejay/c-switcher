@@ -16,6 +16,7 @@ import AddModal from "./components/AddModal";
 import UsageModal from "./components/UsageModal";
 import ConfirmDialog from "./components/ConfirmDialog";
 import Toast from "./components/Toast";
+import VersionLabel from "./components/VersionLabel";
 
 let toastId = 0;
 
@@ -196,6 +197,7 @@ export default function App() {
       />
 
       <Toast toasts={toasts} onRemove={removeToast} />
+      <VersionLabel />
     </>
   );
 }
