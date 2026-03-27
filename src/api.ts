@@ -21,14 +21,9 @@ export async function deleteProfile(name: string): Promise<OpResult> {
   return invoke("delete_profile", { name });
 }
 
-export async function refreshToken(
-  profileName?: string | null
-): Promise<OpResult> {
-  return invoke("refresh_token", { profileName: profileName ?? null });
-}
-
 export async function getUsage(
   profileName?: string | null
 ): Promise<UsageResult> {
   return invoke("get_usage", { profileName: profileName ?? null });
 }
+

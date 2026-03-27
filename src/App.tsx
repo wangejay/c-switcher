@@ -7,7 +7,6 @@ import {
   backupProfile,
   switchProfile,
   deleteProfile,
-  refreshToken,
   getUsage,
 } from "./api";
 import TopBar from "./components/TopBar";
@@ -73,19 +72,6 @@ export default function App() {
       loadProfiles();
     } else {
       toast(result.error || "Switch failed", "error");
-    }
-  };
-
-  const handleRefresh = async (profileName: string | null) => {
-    const label = profileName ?? "current";
-    toast(`Refreshing ${label} token...`, "info");
-    const result = await refreshToken(profileName);
-    if (result.success) {
-      toast(`Token refreshed! Expires: ${result.expiresAt}`, "success");
-      loadCurrent();
-      loadProfiles();
-    } else {
-      toast(result.error || "Refresh failed", "error");
     }
   };
 
@@ -162,7 +148,6 @@ export default function App() {
                   profile={p}
                   isCurrent={isCurrent}
                   onSwitch={() => handleSwitch(p.name)}
-                  onRefresh={() => handleRefresh(p.name)}
                   onUsage={() => handleUsage(p.name)}
                   onDelete={() => setConfirmTarget(p.name)}
                 />
