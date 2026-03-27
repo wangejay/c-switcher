@@ -421,11 +421,61 @@ pub async fn switch_profile_impl(name: String) -> OpResult {
         pf.oauth_account.email_address.clone()
     };
 
+    // Before switching away, save the current Keychain token back to the
+    // outgoing profile file so it stays up-to-date (Claude Code may have
+    // rotated the token since the profile was last saved).
+    if let Ok(current_keychain) = get_keychain_token().await {
+        let dir = profiles_dir();
+        if dir.exists() {
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for entry in rd.filter_map(|e| e.ok()) {
+                    let ep = entry.path();
+                    if ep.extension().map(|x| x == "json").unwrap_or(false) {
+                        if let Ok(content) = std::fs::read_to_string(&ep) {
+                            if let Ok(mut epf) =
+                                serde_json::from_str::<ProfileFile>(&content)
+                            {
+                                if epf.oauth_account.email_address
+                                    == current_oauth.email_address
+                                    && epf.oauth_account.account_uuid
+                                        == current_oauth.account_uuid
+                                {
+                                    epf.keychain_token = current_keychain.clone();
+                                    if let Ok(json) = serde_json::to_string_pretty(&epf)
+                                    {
+                                        let _ =
+                                            std::fs::write(&ep, format!("{}\n", json));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Err(e) = set_keychain_token(&pf.keychain_token).await {
         return OpResult::err(&e);
     }
     if let Err(e) = write_oauth_account(&pf.oauth_account) {
         return OpResult::err(&e);
+    }
+
+    // Check if the switched-to token is expired and auto-refresh
+    let token_data: serde_json::Value =
+        serde_json::from_str(&pf.keychain_token).unwrap_or_default();
+    let expires_at = token_data
+        .get("claudeAiOauth")
+        .and_then(|o| o.get("expiresAt"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let is_expired = expires_at == 0 || expires_at < now_ms();
+
+    if is_expired {
+        // Auto-refresh the profile token after switch
+        let _ = refresh_token_impl(Some(name)).await;
     }
 
     let mut r = OpResult::ok("已切換帳號");
@@ -465,7 +515,23 @@ pub async fn refresh_token_impl(profile_name: Option<String>) -> OpResult {
             Ok(p) => p,
             Err(e) => return OpResult::err(&e),
         };
-        (pf.keychain_token, Some(path))
+
+        // If this profile is the currently active account, prefer the Keychain token
+        // because Claude Code may have refreshed the token (rotating the refresh token),
+        // making the profile file's refresh token stale/invalid.
+        let token = if let Ok(current_oauth) = read_oauth_account() {
+            if current_oauth.email_address == pf.oauth_account.email_address
+                && current_oauth.account_uuid == pf.oauth_account.account_uuid
+            {
+                // Active account — use the latest token from Keychain
+                get_keychain_token().await.unwrap_or(pf.keychain_token)
+            } else {
+                pf.keychain_token
+            }
+        } else {
+            pf.keychain_token
+        };
+        (token, Some(path))
     } else {
         match get_keychain_token().await {
             Ok(t) => (t, None),
@@ -636,7 +702,21 @@ pub async fn get_usage_impl(profile_name: Option<String>) -> UsageResult {
             .and_then(|s| {
                 serde_json::from_str::<ProfileFile>(&s).map_err(|e| e.to_string())
             }) {
-            Ok(pf) => pf.keychain_token,
+            Ok(pf) => {
+                // If this profile is the currently active account, use Keychain token
+                // (Claude Code may have rotated the refresh/access token)
+                if let Ok(current_oauth) = read_oauth_account() {
+                    if current_oauth.email_address == pf.oauth_account.email_address
+                        && current_oauth.account_uuid == pf.oauth_account.account_uuid
+                    {
+                        get_keychain_token().await.unwrap_or(pf.keychain_token)
+                    } else {
+                        pf.keychain_token
+                    }
+                } else {
+                    pf.keychain_token
+                }
+            }
             Err(e) => {
                 return UsageResult {
                     success: false,
@@ -688,6 +768,103 @@ pub async fn get_usage_impl(profile_name: Option<String>) -> UsageResult {
             }
         }
     };
+
+    if resp.status().as_u16() == 401 {
+        // Token expired — auto-refresh and retry once
+        let refresh_result = refresh_token_impl(profile_name.clone()).await;
+        if !refresh_result.success {
+            return UsageResult {
+                success: false,
+                error: Some(format!(
+                    "Token expired and refresh failed: {}",
+                    refresh_result.error.unwrap_or_default()
+                )),
+                data: None,
+            };
+        }
+
+        // Re-read the (now refreshed) token
+        let new_token_str = if let Some(ref pname) = profile_name {
+            let path = profiles_dir().join(format!("{}.json", pname));
+            match std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| {
+                    serde_json::from_str::<ProfileFile>(&s).map_err(|e| e.to_string())
+                }) {
+                Ok(pf) => pf.keychain_token,
+                Err(e) => {
+                    return UsageResult {
+                        success: false,
+                        error: Some(e),
+                        data: None,
+                    }
+                }
+            }
+        } else {
+            match get_keychain_token().await {
+                Ok(t) => t,
+                Err(e) => {
+                    return UsageResult {
+                        success: false,
+                        error: Some(e),
+                        data: None,
+                    }
+                }
+            }
+        };
+
+        let new_access = match extract_access_token(&new_token_str) {
+            Ok(t) => t,
+            Err(e) => {
+                return UsageResult {
+                    success: false,
+                    error: Some(e),
+                    data: None,
+                }
+            }
+        };
+
+        // Retry the usage API call with refreshed token
+        let retry_resp = match client
+            .get("https://api.anthropic.com/api/oauth/usage")
+            .header("Authorization", format!("Bearer {}", new_access))
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return UsageResult {
+                    success: false,
+                    error: Some(format!("HTTP error on retry: {}", e)),
+                    data: None,
+                }
+            }
+        };
+
+        if !retry_resp.status().is_success() {
+            let status = retry_resp.status().as_u16();
+            let body_text = retry_resp.text().await.unwrap_or_default();
+            return UsageResult {
+                success: false,
+                error: Some(format!("HTTP {} (after refresh): {}", status, body_text)),
+                data: None,
+            };
+        }
+
+        return match retry_resp.json::<serde_json::Value>().await {
+            Ok(data) => UsageResult {
+                success: true,
+                error: None,
+                data: Some(data),
+            },
+            Err(e) => UsageResult {
+                success: false,
+                error: Some(format!("Parse response: {}", e)),
+                data: None,
+            },
+        };
+    }
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
