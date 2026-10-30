@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import type { CurrentInfo, ProfileEntry } from "./types";
 import type { ToastItem, ToastType } from "./components/Toast";
 import type { UsageState } from "./usage";
@@ -24,6 +30,10 @@ let toastId = 0;
 /** Re-query usage when the window regains focus, at most this often. */
 const USAGE_FOCUS_THROTTLE_MS = 30_000;
 
+/** Card reorder animation (FLIP) when the active account moves to the top. */
+const REORDER_MS = 600;
+const REORDER_EASING = "cubic-bezier(0.16, 1, 0.3, 1)";
+
 /** The first profile whose email matches the active account is the Active one. */
 function currentProfileName(
   profiles: ProfileEntry[],
@@ -47,6 +57,10 @@ export default function App() {
   const [usageData, setUsageData] = useState<any>(undefined);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set());
+  const listRef = useRef<HTMLDivElement>(null);
+  const cardEls = useRef(new Map<string, HTMLDivElement>());
+  const cardTops = useRef(new Map<string, number>());
+  const lastOrder = useRef("");
 
   const toast = useCallback((message: string, type: ToastType = "info") => {
     setToasts((prev) => [...prev, { id: ++toastId, message, type }]);
@@ -234,12 +248,58 @@ export default function App() {
   };
 
   const current = currentProfileName(profiles, info?.email);
+  // The active account always sits on top; the rest keep their file order.
+  const ordered = current
+    ? [
+        ...profiles.filter((p) => p.name === current),
+        ...profiles.filter((p) => p.name !== current),
+      ]
+    : profiles;
+  const orderKey = ordered.map((p) => p.name).join("\n");
+
+  // FLIP: when the order changes, start each card at its old position and
+  // glide it to the new one. Positions are recorded after every render so
+  // usage loading (which changes card heights) never leaves stale offsets.
+  useLayoutEffect(() => {
+    const tops = new Map<string, number>();
+    cardEls.current.forEach((el, name) =>
+      tops.set(name, el.getBoundingClientRect().top)
+    );
+    const reordered =
+      lastOrder.current !== "" && lastOrder.current !== orderKey;
+    const reduceMotion = window.matchMedia(
+      "(prefers-reduced-motion: reduce)"
+    ).matches;
+    if (reordered && !reduceMotion) {
+      listRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+      cardEls.current.forEach((el, name) => {
+        const prev = cardTops.current.get(name);
+        const now = tops.get(name);
+        if (prev === undefined || now === undefined) return;
+        const dy = prev - now;
+        if (Math.abs(dy) < 1) return;
+        // Cards moving up pass over the ones moving down.
+        el.style.zIndex = dy > 0 ? "2" : "1";
+        el.animate(
+          [
+            { transform: `translateY(${dy}px)` },
+            { transform: "translateY(0)" },
+          ],
+          { duration: REORDER_MS, easing: REORDER_EASING }
+        ).onfinish = () => {
+          el.style.zIndex = "";
+        };
+      });
+    }
+    cardTops.current = tops;
+    lastOrder.current = orderKey;
+  });
 
   return (
     <>
       <TopBar onAdd={() => setShowAddModal(true)} />
 
-      <div className="list-container">
+      <div className="list-container" ref={listRef}>
         {profiles.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20 text-text3">
             <div className="w-14 h-14 rounded-2xl bg-surface-light flex items-center justify-center mb-4 ring-1 ring-border">
@@ -264,18 +324,26 @@ export default function App() {
             </span>
           </div>
         ) : (
-          profiles.map((p) => (
-            <ProfileRow
+          ordered.map((p) => (
+            <div
               key={p.name}
-              profile={p}
-              isCurrent={p.name === current}
-              usage={usage[p.name]}
-              onSwitch={() => handleSwitch(p.name)}
-              onRefresh={(force) => handleRefresh(p.name, force)}
-              refreshing={refreshing.has(p.name)}
-              onUsage={() => handleUsage(p.name)}
-              onDelete={() => setConfirmTarget(p.name)}
-            />
+              className="relative"
+              ref={(el) => {
+                if (el) cardEls.current.set(p.name, el);
+                else cardEls.current.delete(p.name);
+              }}
+            >
+              <ProfileRow
+                profile={p}
+                isCurrent={p.name === current}
+                usage={usage[p.name]}
+                onSwitch={() => handleSwitch(p.name)}
+                onRefresh={(force) => handleRefresh(p.name, force)}
+                refreshing={refreshing.has(p.name)}
+                onUsage={() => handleUsage(p.name)}
+                onDelete={() => setConfirmTarget(p.name)}
+              />
+            </div>
           ))
         )}
       </div>

@@ -63,19 +63,36 @@ export default function ProfileRow({
     <div
       className={`profile-card group relative flex flex-col border transition-all duration-200 ${
         isCurrent
-          ? "profile-card-active border-blue-500/30 bg-blue-500/[0.04]"
+          ? "profile-card-active border-blue-400/45"
           : "border-border2 bg-surface hover:border-white/15 hover:bg-surface-light/50"
       }`}
       style={{ gap: 10 }}
     >
       {/* Inner top highlight */}
-      <div className="absolute inset-x-0 top-0 h-px rounded-t-2xl bg-gradient-to-r from-transparent via-white/[0.06] to-transparent pointer-events-none" />
+      <div
+        className={`absolute inset-x-0 top-0 h-px rounded-t-2xl bg-gradient-to-r from-transparent to-transparent pointer-events-none ${
+          isCurrent ? "via-blue-300/40" : "via-white/[0.06]"
+        }`}
+      />
+
+      {isCurrent && (
+        <>
+          {/* Accent rail on the left edge */}
+          <div className="active-rail absolute left-0 pointer-events-none" />
+          {/* Light sweep across the card, once on activation then idle */}
+          <div className="active-sweep absolute inset-0 rounded-2xl pointer-events-none" />
+        </>
+      )}
 
       {/* Top row: avatar · identity · actions */}
       <div className="flex items-center gap-4">
         {/* Avatar */}
         <div
-          className={`avatar bg-gradient-to-br ${colorClass} flex items-center justify-center text-[16px] font-bold shrink-0 shadow-lg ring-1 ring-white/20`}
+          className={`avatar bg-gradient-to-br ${colorClass} flex items-center justify-center text-[16px] font-bold shrink-0 shadow-lg ${
+            isCurrent
+              ? "ring-2 ring-blue-400/80 ring-offset-2 ring-offset-bg"
+              : "ring-1 ring-white/20"
+          }`}
         >
           {initial}
         </div>
@@ -124,7 +141,11 @@ export default function ProfileRow({
         {/* Actions */}
         <div className="flex items-center gap-1 shrink-0">
           {isCurrent ? (
-            <span className="badge-active text-[14px] font-bold bg-blue-500/15 text-blue-400 ring-1 ring-blue-400/25 tracking-wide">
+            <span className="badge-active inline-flex items-center gap-2 text-[14px] font-bold bg-blue-500/20 text-blue-300 ring-1 ring-blue-400/50 tracking-wide">
+              <span className="relative flex w-2 h-2">
+                <span className="absolute inset-0 rounded-full bg-blue-400 animate-ping opacity-75" />
+                <span className="relative w-2 h-2 rounded-full bg-blue-400" />
+              </span>
               Active
             </span>
           ) : (

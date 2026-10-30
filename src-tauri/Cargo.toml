@@ -1,6 +1,6 @@
 [package]
 name = "c-switcher"
-version = "1.0.0"
+version = "1.0.1"
 description = "Claude Code Auth Token Switcher"
 authors = ["wangejay"]
 edition = "2021"
