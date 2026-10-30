@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { CurrentInfo, ProfileEntry } from "./types";
 import type { ToastItem, ToastType } from "./components/Toast";
+import type { UsageState } from "./usage";
 import {
   getCurrentInfo,
   listProfiles,
@@ -20,9 +21,23 @@ import VersionLabel from "./components/VersionLabel";
 
 let toastId = 0;
 
+/** Re-query usage when the window regains focus, at most this often. */
+const USAGE_FOCUS_THROTTLE_MS = 30_000;
+
+/** The first profile whose email matches the active account is the Active one. */
+function currentProfileName(
+  profiles: ProfileEntry[],
+  email?: string
+): string | null {
+  if (!email) return null;
+  return profiles.find((p) => p.email === email)?.name ?? null;
+}
+
 export default function App() {
   const [info, setInfo] = useState<CurrentInfo | null>(null);
   const [profiles, setProfiles] = useState<ProfileEntry[]>([]);
+  const [usage, setUsage] = useState<Record<string, UsageState>>({});
+  const lastUsageFetch = useRef(0);
   const [showAddModal, setShowAddModal] = useState(false);
   const [confirmTarget, setConfirmTarget] = useState<string | null>(null);
   const [usageTarget, setUsageTarget] = useState<string | null>(null);
@@ -41,26 +56,92 @@ export default function App() {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
-  const loadCurrent = useCallback(async () => {
-    const result = await getCurrentInfo();
-    setInfo(result);
-  }, []);
+  /**
+   * Fetch one profile's usage. The usage endpoint is a read-only account
+   * query: it runs no model and costs no tokens. Returns true if the
+   * profile's token had to be refreshed first.
+   */
+  const loadUsageFor = useCallback(
+    async (p: ProfileEntry, isCurrent: boolean): Promise<boolean> => {
+      setUsage((prev) => ({
+        ...prev,
+        [p.name]: { ...prev[p.name], loading: true },
+      }));
 
-  const loadProfiles = useCallback(async () => {
-    const result = await listProfiles();
-    setProfiles(result);
-  }, []);
+      // Expired non-active profile: refresh its token first (same rule as the
+      // csw CLI). The active account's token is managed by Claude Code itself.
+      let refreshed = false;
+      if (p.isExpired && !isCurrent) {
+        const r = await refreshToken(p.name);
+        refreshed = r.success && !r.skipped;
+      }
+
+      // The active profile reads the live keychain token, which Claude Code
+      // keeps fresh; the profile file's copy may be stale.
+      const result = await getUsage(isCurrent ? null : p.name);
+      setUsage((prev) => ({
+        ...prev,
+        [p.name]: result.success
+          ? { loading: false, data: result.data, fetchedAt: Date.now() }
+          : {
+              loading: false,
+              error: result.error || "Failed to fetch usage",
+              data: prev[p.name]?.data,
+              fetchedAt: prev[p.name]?.fetchedAt,
+            },
+      }));
+      return refreshed;
+    },
+    []
+  );
+
+  /** Fetch usage for every profile in parallel. */
+  const loadAllUsage = useCallback(
+    async (list: ProfileEntry[], currentEmail?: string) => {
+      lastUsageFetch.current = Date.now();
+      const current = currentProfileName(list, currentEmail);
+      const refreshed = await Promise.all(
+        list.map((p) => loadUsageFor(p, p.name === current))
+      );
+      // A token was rotated: re-list so the status dots catch up.
+      if (refreshed.some(Boolean)) setProfiles(await listProfiles());
+    },
+    [loadUsageFor]
+  );
+
+  /** Reload the active account, the profile list and every profile's usage. */
+  const reloadAll = useCallback(async () => {
+    const [inf, list] = await Promise.all([getCurrentInfo(), listProfiles()]);
+    setInfo(inf);
+    setProfiles(list);
+    await loadAllUsage(list, inf.email);
+  }, [loadAllUsage]);
 
   useEffect(() => {
-    loadCurrent();
-    loadProfiles();
-  }, [loadCurrent, loadProfiles]);
+    reloadAll();
+  }, [reloadAll]);
+
+  // Usage is only re-queried on focus (throttled) and after actions; there is
+  // no background polling.
+  useEffect(() => {
+    const onFocus = () => {
+      if (document.visibilityState === "hidden") return;
+      if (Date.now() - lastUsageFetch.current < USAGE_FOCUS_THROTTLE_MS) return;
+      reloadAll();
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+    };
+  }, [reloadAll]);
 
   const handleBackup = async (name: string) => {
     const result = await backupProfile(name);
     if (result.success) {
       toast(`Backed up: ${result.email}`, "success");
-      loadProfiles();
+      reloadAll();
     } else {
       toast(result.error || "Backup failed", "error");
     }
@@ -70,8 +151,7 @@ export default function App() {
     const result = await switchProfile(name);
     if (result.success) {
       toast(`Switched: ${result.from} → ${result.to}`, "success");
-      loadCurrent();
-      loadProfiles();
+      reloadAll();
     } else {
       toast(result.error || "Switch failed", "error");
     }
@@ -91,8 +171,7 @@ export default function App() {
         );
       } else if (result.success) {
         toast(`Token refreshed! Expires: ${result.expiresAt}`, "success");
-        loadCurrent();
-        loadProfiles();
+        reloadAll();
       } else {
         toast(result.error || "Refresh failed", "error");
       }
@@ -112,31 +191,49 @@ export default function App() {
     const result = await deleteProfile(name);
     if (result.success) {
       toast(result.message || "Deleted", "success");
-      loadProfiles();
+      setUsage((prev) => {
+        const next = { ...prev };
+        delete next[name];
+        return next;
+      });
+      reloadAll();
     } else {
       toast(result.error || "Delete failed", "error");
     }
   };
 
   const handleUsage = async (profileName: string) => {
+    // Show what the row already has, then refresh it in the background.
+    const cached = usage[profileName]?.data;
     setUsageTarget(profileName);
-    setUsageLoading(true);
+    setUsageLoading(!cached);
     setUsageError(undefined);
-    setUsageData(undefined);
-    const result = await getUsage(profileName);
+    setUsageData(cached);
+    const isCurrent =
+      profileName === currentProfileName(profiles, info?.email);
+    const result = await getUsage(isCurrent ? null : profileName);
     setUsageLoading(false);
     if (result.success) {
       setUsageData(result.data);
+      setUsage((prev) => ({
+        ...prev,
+        [profileName]: {
+          loading: false,
+          data: result.data,
+          fetchedAt: Date.now(),
+        },
+      }));
     } else {
       setUsageError(result.error || "Failed to fetch usage");
     }
   };
 
   const handleReload = () => {
-    loadCurrent();
-    loadProfiles();
+    reloadAll();
     toast("Reloaded!", "success");
   };
+
+  const current = currentProfileName(profiles, info?.email);
 
   return (
     <>
@@ -167,25 +264,19 @@ export default function App() {
             </span>
           </div>
         ) : (
-          (() => {
-            let matched = false;
-            return profiles.map((p) => {
-              const isCurrent = !matched && p.email === info?.email;
-              if (isCurrent) matched = true;
-              return (
-                <ProfileRow
-                  key={p.name}
-                  profile={p}
-                  isCurrent={isCurrent}
-                  onSwitch={() => handleSwitch(p.name)}
-                  onRefresh={(force) => handleRefresh(p.name, force)}
-                  refreshing={refreshing.has(p.name)}
-                  onUsage={() => handleUsage(p.name)}
-                  onDelete={() => setConfirmTarget(p.name)}
-                />
-              );
-            });
-          })()
+          profiles.map((p) => (
+            <ProfileRow
+              key={p.name}
+              profile={p}
+              isCurrent={p.name === current}
+              usage={usage[p.name]}
+              onSwitch={() => handleSwitch(p.name)}
+              onRefresh={(force) => handleRefresh(p.name, force)}
+              refreshing={refreshing.has(p.name)}
+              onUsage={() => handleUsage(p.name)}
+              onDelete={() => setConfirmTarget(p.name)}
+            />
+          ))
         )}
       </div>
 

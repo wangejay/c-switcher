@@ -1,3 +1,5 @@
+import { extractUsageBars, formatResetTime } from "../usage";
+
 interface Props {
   open: boolean;
   profileName: string;
@@ -6,25 +8,6 @@ interface Props {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   data?: any;
   onClose: () => void;
-}
-
-function formatResetTime(isoStr: string): string {
-  try {
-    const d = new Date(isoStr);
-    const now = new Date();
-    const diffMs = d.getTime() - now.getTime();
-    if (diffMs <= 0) return "now";
-    const diffH = Math.floor(diffMs / 3600000);
-    const diffM = Math.floor((diffMs % 3600000) / 60000);
-    if (diffH > 24) {
-      const days = Math.floor(diffH / 24);
-      return `${days}d ${diffH % 24}h`;
-    }
-    if (diffH > 0) return `${diffH}h ${diffM}m`;
-    return `${diffM}m`;
-  } catch {
-    return isoStr;
-  }
 }
 
 export default function UsageModal({
@@ -92,12 +75,11 @@ function UsageContent({ data }: { data: any }) {
   const monthlyLimit = data.monthly_limit;
   const usedCredits = data.used_credits ?? 0;
   const utilization = data.utilization ?? 0;
-  const fiveHour = data.five_hour;
-  const sevenDay = data.seven_day;
+  const bars = extractUsageBars(data);
 
   const hasMonthly = monthlyLimit !== undefined;
 
-  if (!hasMonthly && !fiveHour && !sevenDay) {
+  if (!hasMonthly && bars.length === 0) {
     return (
       <div className="modal-body">
         <pre className="text-[14px] text-text2 bg-bg2 rounded-xl overflow-auto max-h-[300px] ring-1 ring-border whitespace-pre-wrap break-all" style={{ padding: 16 }}>
@@ -126,21 +108,12 @@ function UsageContent({ data }: { data: any }) {
         </div>
       )}
 
-      {/* Rate limits */}
-      {(fiveHour || sevenDay) && (
+      {/* Rate limits: 5h · 7d · model-scoped (e.g. Fable) */}
+      {bars.length > 0 && (
         <div className="flex flex-col gap-sm">
-          {fiveHour && (
-            <RateBar label="5-Hour" pct={fiveHour.utilization} resetsAt={fiveHour.resets_at} />
-          )}
-          {sevenDay && (
-            <RateBar label="7-Day" pct={sevenDay.utilization} resetsAt={sevenDay.resets_at} />
-          )}
-          {data.seven_day_opus && (
-            <RateBar label="Opus 7d" pct={data.seven_day_opus.utilization} resetsAt={data.seven_day_opus.resets_at} />
-          )}
-          {data.seven_day_sonnet && (
-            <RateBar label="Sonnet 7d" pct={data.seven_day_sonnet.utilization} resetsAt={data.seven_day_sonnet.resets_at} />
-          )}
+          {bars.map((b) => (
+            <RateBar key={b.key} label={b.label} pct={b.pct} resetsAt={b.resetsAt} />
+          ))}
         </div>
       )}
     </div>
@@ -225,7 +198,7 @@ function RateBar({ label, pct, resetsAt }: { label: string; pct: number; resetsA
           </span>
         </div>
       </div>
-      <div className="h-2 rounded-full bg-bg overflow-hidden ring-1 ring-white/[0.04]">
+      <div className="h-2 rounded-full bg-white/10 overflow-hidden">
         <div
           className={`h-full rounded-full ${color} shadow-md ${glowColor}`}
           style={{ width: `${Math.min(pct, 100)}%`, transition: "width 0.5s ease" }}

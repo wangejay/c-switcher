@@ -170,6 +170,42 @@ pub struct ProfileEntry {
     pub billing: String,
     pub expires_at: u64,
     pub is_expired: bool,
+    /// Human-readable subscription plan, e.g. "Max 20x", "Pro"; empty if unknown.
+    pub plan: String,
+}
+
+/// Derive a plan label from the stored OAuth token's subscriptionType / rateLimitTier.
+pub fn plan_label(token_data: &serde_json::Value) -> String {
+    let oauth = token_data.get("claudeAiOauth");
+    let field = |k: &str| {
+        oauth
+            .and_then(|o| o.get(k))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase()
+    };
+    let sub = field("subscriptionType");
+    let tier = field("rateLimitTier");
+
+    if tier.contains("max_20x") {
+        return "Max 20x".into();
+    }
+    if tier.contains("max_5x") {
+        return "Max 5x".into();
+    }
+    match sub.as_str() {
+        "" => String::new(),
+        "max" => "Max".into(),
+        "pro" => "Pro".into(),
+        "team" => "Team".into(),
+        "enterprise" => "Enterprise".into(),
+        other => {
+            let mut c = other.chars();
+            c.next()
+                .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                .unwrap_or_default()
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -342,6 +378,7 @@ pub async fn list_profiles_impl() -> Vec<ProfileEntry> {
                     billing: pf.oauth_account.billing_type,
                     expires_at,
                     is_expired,
+                    plan: plan_label(&token_data),
                 });
             }
             Err(_) => {
@@ -353,6 +390,7 @@ pub async fn list_profiles_impl() -> Vec<ProfileEntry> {
                     billing: String::new(),
                     expires_at: 0,
                     is_expired: true,
+                    plan: String::new(),
                 });
             }
         }
@@ -778,7 +816,7 @@ pub async fn get_usage_impl(profile_name: Option<String>) -> UsageResult {
         let body_text = resp.text().await.unwrap_or_default();
         return UsageResult {
             success: false,
-            error: Some(format!("HTTP {}: {}", status, body_text)),
+            error: Some(describe_http_error(status, &body_text)),
             data: None,
         };
     }
@@ -854,6 +892,18 @@ mod tests {
     fn describe_http_error_falls_back_to_raw_or_status() {
         assert_eq!(describe_http_error(502, "<html>Bad Gateway</html>"), "HTTP 502: <html>Bad Gateway</html>");
         assert_eq!(describe_http_error(503, "   "), "HTTP 503");
+    }
+
+    #[test]
+    fn plan_label_from_token() {
+        let t = |sub: &str, tier: &str| {
+            serde_json::json!({"claudeAiOauth": {"subscriptionType": sub, "rateLimitTier": tier}})
+        };
+        assert_eq!(plan_label(&t("max", "default_claude_max_20x")), "Max 20x");
+        assert_eq!(plan_label(&t("max", "default_claude_max_5x")), "Max 5x");
+        assert_eq!(plan_label(&t("pro", "default_claude_ai")), "Pro");
+        assert_eq!(plan_label(&t("team", "")), "Team");
+        assert_eq!(plan_label(&serde_json::json!({})), "");
     }
 
     #[test]

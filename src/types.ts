@@ -17,6 +17,8 @@ export interface ProfileEntry {
   billing: string;
   expiresAt: number;
   isExpired: boolean;
+  /** Subscription plan, e.g. "Max 20x", "Pro"; empty if unknown. */
+  plan: string;
 }
 
 export interface UsageResult {
