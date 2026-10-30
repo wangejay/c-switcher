@@ -4,9 +4,11 @@ interface Props {
   profile: ProfileEntry;
   isCurrent: boolean;
   onSwitch: () => void;
-  onRefresh: () => void;
+  /** `force` is true on Shift+click: refresh even if the token is still valid. */
+  onRefresh: (force: boolean) => void;
   onDelete: () => void;
   onUsage: () => void;
+  refreshing?: boolean;
 }
 
 const avatarColors = [
@@ -35,6 +37,7 @@ export default function ProfileRow({
   onRefresh,
   onDelete,
   onUsage,
+  refreshing = false,
 }: Props) {
   const colorClass = getAvatarColor(profile.name);
   const initial = profile.name[0]?.toUpperCase() ?? "?";
@@ -133,13 +136,15 @@ export default function ProfileRow({
           Usage
         </button>
         <button
-          className={`action-btn hover:bg-surface-lighter hover:text-text ${
-            isCurrent ? "" : "opacity-0 group-hover:opacity-100"
+          className={`action-btn hover:bg-surface-lighter hover:text-text disabled:opacity-50 disabled:cursor-default ${
+            isCurrent || refreshing ? "" : "opacity-0 group-hover:opacity-100"
           }`}
-          onClick={onRefresh}
+          onClick={(e) => onRefresh(e.shiftKey)}
+          disabled={refreshing}
+          title="Refresh token (Shift+click to force while still valid)"
         >
           <svg
-            className="w-[13px] h-[13px]"
+            className={`w-[13px] h-[13px] ${refreshing ? "animate-spin" : ""}`}
             fill="none"
             viewBox="0 0 24 24"
             stroke="currentColor"
@@ -151,7 +156,7 @@ export default function ProfileRow({
               d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182"
             />
           </svg>
-          Refresh
+          {refreshing ? "Refreshing…" : "Refresh"}
         </button>
         <button
           className={`action-btn hover:bg-danger/12 hover:text-danger ${

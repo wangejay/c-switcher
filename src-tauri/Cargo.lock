@@ -179,6 +179,7 @@ dependencies = [
 name = "c-switcher"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs",
  "reqwest 0.12.28",
  "serde",

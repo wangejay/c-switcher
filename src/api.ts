@@ -22,9 +22,10 @@ export async function deleteProfile(name: string): Promise<OpResult> {
 }
 
 export async function refreshToken(
-  profileName?: string | null
+  profileName?: string | null,
+  force = false
 ): Promise<OpResult> {
-  return invoke("refresh_token", { profileName: profileName ?? null });
+  return invoke("refresh_token", { profileName: profileName ?? null, force });
 }
 
 export async function getUsage(

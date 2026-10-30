@@ -121,7 +121,7 @@ async fn refresh_expired_profiles(profiles: &[ProfileEntry]) {
     for p in &expired {
         let name = p.name.clone();
         set.spawn(async move {
-            let result = refresh_token_impl(Some(name.clone())).await;
+            let result = refresh_token_impl(Some(name.clone()), false).await;
             (name, result)
         });
     }
@@ -129,7 +129,9 @@ async fn refresh_expired_profiles(profiles: &[ProfileEntry]) {
     while let Some(result) = set.join_next().await {
         match result {
             Ok((name, op)) => {
-                if op.success {
+                if op.skipped.unwrap_or(false) {
+                    eprintln!("  {}- {} still valid, skipped{}", DIM, name, RESET);
+                } else if op.success {
                     eprintln!("  {}✓ {} refreshed{}", GREEN, name, RESET);
                 } else {
                     let err = op.error.unwrap_or_else(|| "unknown".into());

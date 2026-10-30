@@ -31,6 +31,7 @@ export default function App() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [usageData, setUsageData] = useState<any>(undefined);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const [refreshing, setRefreshing] = useState<Set<string>>(new Set());
 
   const toast = useCallback((message: string, type: ToastType = "info") => {
     setToasts((prev) => [...prev, { id: ++toastId, message, type }]);
@@ -76,16 +77,31 @@ export default function App() {
     }
   };
 
-  const handleRefresh = async (profileName: string | null) => {
-    const label = profileName ?? "current";
-    toast(`Refreshing ${label} token...`, "info");
-    const result = await refreshToken(profileName);
-    if (result.success) {
-      toast(`Token refreshed! Expires: ${result.expiresAt}`, "success");
-      loadCurrent();
-      loadProfiles();
-    } else {
-      toast(result.error || "Refresh failed", "error");
+  const handleRefresh = async (profileName: string, force = false) => {
+    // One in-flight refresh per profile; repeated clicks would only earn a 429.
+    if (refreshing.has(profileName)) return;
+    setRefreshing((prev) => new Set(prev).add(profileName));
+    toast(`Refreshing ${profileName} token...`, "info");
+    try {
+      const result = await refreshToken(profileName, force);
+      if (result.skipped) {
+        toast(
+          `${profileName} token is still valid (expires ${result.expiresAt}). Shift+click Refresh to force.`,
+          "info"
+        );
+      } else if (result.success) {
+        toast(`Token refreshed! Expires: ${result.expiresAt}`, "success");
+        loadCurrent();
+        loadProfiles();
+      } else {
+        toast(result.error || "Refresh failed", "error");
+      }
+    } finally {
+      setRefreshing((prev) => {
+        const next = new Set(prev);
+        next.delete(profileName);
+        return next;
+      });
     }
   };
 
@@ -162,7 +178,8 @@ export default function App() {
                   profile={p}
                   isCurrent={isCurrent}
                   onSwitch={() => handleSwitch(p.name)}
-                  onRefresh={() => handleRefresh(p.name)}
+                  onRefresh={(force) => handleRefresh(p.name, force)}
+                  refreshing={refreshing.has(p.name)}
                   onUsage={() => handleUsage(p.name)}
                   onDelete={() => setConfirmTarget(p.name)}
                 />

@@ -3,10 +3,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
+use tokio::time::{sleep, Duration};
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+/// Skip a non-forced refresh while the token still has at least this long to live.
+const REFRESH_SKIP_MARGIN_MS: u64 = 5 * 60 * 1000;
+/// Attempts against the token endpoint before giving up on HTTP 429.
+const REFRESH_MAX_ATTEMPTS: u32 = 3;
+/// Longest pause accepted between attempts; a larger Retry-After is reported instead.
+const REFRESH_MAX_WAIT_SECS: u64 = 10;
 
 fn keychain_account() -> String {
     std::env::var("USER").unwrap_or_else(|_| "wangejay".to_string())
@@ -185,6 +192,9 @@ pub struct OpResult {
     pub expires_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_token_preview: Option<String>,
+    /// True when a refresh was not needed (token still valid) and no request was made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<bool>,
 }
 
 impl OpResult {
@@ -199,6 +209,7 @@ impl OpResult {
             to: None,
             expires_at: None,
             access_token_preview: None,
+            skipped: None,
         }
     }
     pub fn err(error: &str) -> Self {
@@ -212,6 +223,7 @@ impl OpResult {
             to: None,
             expires_at: None,
             access_token_preview: None,
+            skipped: None,
         }
     }
 }
@@ -451,7 +463,94 @@ async fn delete_profile(name: String) -> OpResult {
     }
 }
 
-pub async fn refresh_token_impl(profile_name: Option<String>) -> OpResult {
+/// POST a refresh_token grant to the OAuth token endpoint.
+/// Retries with backoff on HTTP 429, honouring Retry-After when it is short.
+async fn post_token_refresh(refresh_tok: &str) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_tok,
+        "client_id": OAUTH_CLIENT_ID,
+    });
+
+    let mut attempt: u32 = 1;
+    loop {
+        let resp = client
+            .post(OAUTH_TOKEN_URL)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "claude-code/2.1.0")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP error: {}", e))?;
+
+        let status = resp.status().as_u16();
+        if resp.status().is_success() {
+            return resp
+                .json()
+                .await
+                .map_err(|e| format!("Parse response: {}", e));
+        }
+
+        let retry_after = parse_retry_after(resp.headers());
+        let body_text = resp.text().await.unwrap_or_default();
+        if status != 429 {
+            return Err(describe_http_error(status, &body_text));
+        }
+
+        // Rate limited: back off and retry while the wait is short.
+        let wait_secs = retry_after.unwrap_or(1u64 << (attempt - 1));
+        if attempt >= REFRESH_MAX_ATTEMPTS || wait_secs > REFRESH_MAX_WAIT_SECS {
+            let hint = match retry_after {
+                Some(s) => format!("請在 {} 秒後再試", s),
+                None => "請稍後再試".to_string(),
+            };
+            return Err(format!("請求太頻繁（HTTP 429），{}", hint));
+        }
+        sleep(Duration::from_secs(wait_secs)).await;
+        attempt += 1;
+    }
+}
+
+/// Retry-After in seconds; an HTTP-date value is ignored.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Turn a non-2xx token response into a one-line, human-readable error.
+fn describe_http_error(status: u16, body: &str) -> String {
+    let json: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let err = json.as_ref().and_then(|v| v.get("error"));
+
+    // Anthropic style: {"error": {"type": "...", "message": "..."}}
+    // OAuth style:     {"error": "invalid_grant", "error_description": "..."}
+    let code = err
+        .and_then(|e| e.get("type").and_then(|t| t.as_str()).or_else(|| e.as_str()))
+        .unwrap_or("");
+    let detail = err
+        .and_then(|e| e.get("message").and_then(|m| m.as_str()))
+        .or_else(|| json.as_ref()?.get("error_description")?.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| body.trim().to_string());
+
+    match code {
+        "invalid_grant" => {
+            "Refresh token 已失效，請在 Claude Code 重新登入後再備份此 profile".to_string()
+        }
+        _ if detail.is_empty() => format!("HTTP {}", status),
+        _ => format!("HTTP {}: {}", status, detail),
+    }
+}
+
+/// Refresh the access token of `profile_name` (or the active keychain token when None).
+/// Unless `force` is set, a token that is still comfortably valid is left alone.
+pub async fn refresh_token_impl(profile_name: Option<String>, force: bool) -> OpResult {
     // Get the token JSON string
     let (token_str, profile_path) = if let Some(ref pname) = profile_name {
         let path = profiles_dir().join(format!("{}.json", pname));
@@ -488,35 +587,24 @@ pub async fn refresh_token_impl(profile_name: Option<String>) -> OpResult {
         None => return OpResult::err("找不到 refreshToken"),
     };
 
-    // POST to token endpoint
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_tok,
-        "client_id": OAUTH_CLIENT_ID,
-    });
-
-    let resp = match client
-        .post(OAUTH_TOKEN_URL)
-        .header("Content-Type", "application/json")
-        .header("User-Agent", "claude-code/2.1.0")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return OpResult::err(&format!("HTTP error: {}", e)),
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body_text = resp.text().await.unwrap_or_default();
-        return OpResult::err(&format!("HTTP {}: {}", status, body_text));
+    // Skip while the token is still comfortably valid, unless the caller insists.
+    if !force {
+        let expires_at = token_json
+            .get("claudeAiOauth")
+            .and_then(|o| o.get("expiresAt"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if expires_at > now_ms() + REFRESH_SKIP_MARGIN_MS {
+            let mut r = OpResult::ok("Token 仍有效，已略過刷新");
+            r.expires_at = Some(format_local_time((expires_at / 1000) as i64));
+            r.skipped = Some(true);
+            return r;
+        }
     }
 
-    let resp_data: serde_json::Value = match resp.json().await {
+    let resp_data = match post_token_refresh(&refresh_tok).await {
         Ok(v) => v,
-        Err(e) => return OpResult::err(&format!("Parse response: {}", e)),
+        Err(e) => return OpResult::err(&e),
     };
 
     let new_access = resp_data
@@ -577,12 +665,8 @@ pub async fn refresh_token_impl(profile_name: Option<String>) -> OpResult {
     }
 
     // Format expiry
-    let expires_secs = (expires_at / 1000) as i64;
-    let naive =
-        chrono_minimal_format(expires_secs);
-
     let mut r = OpResult::ok("Token 刷新完成");
-    r.expires_at = Some(naive);
+    r.expires_at = Some(format_local_time((expires_at / 1000) as i64));
     if new_access.len() > 30 {
         r.access_token_preview = Some(format!(
             "{}...{}",
@@ -594,8 +678,8 @@ pub async fn refresh_token_impl(profile_name: Option<String>) -> OpResult {
 }
 
 #[tauri::command]
-async fn refresh_token(profile_name: Option<String>) -> OpResult {
-    refresh_token_impl(profile_name).await
+async fn refresh_token(profile_name: Option<String>, force: Option<bool>) -> OpResult {
+    refresh_token_impl(profile_name, force.unwrap_or(false)).await
 }
 
 #[derive(Serialize)]
@@ -718,60 +802,13 @@ async fn get_usage(profile_name: Option<String>) -> UsageResult {
     get_usage_impl(profile_name).await
 }
 
-/// Minimal timestamp formatting without pulling in chrono crate
-fn chrono_minimal_format(epoch_secs: i64) -> String {
-    // Use the `date` command on macOS for formatting
-    // But since we're in an async context, just return the epoch-based string
-    // We'll compute it manually
-    let secs = epoch_secs;
-    // Simple approach: return ISO-ish format
-    // Since we don't have chrono, we'll just format the timestamp
-    // using basic arithmetic for UTC
-    let days_since_epoch = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    // Calculate year/month/day from days since epoch (1970-01-01)
-    let mut remaining_days = days_since_epoch;
-    let mut year = 1970i64;
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
+/// Format an epoch timestamp (seconds) as `YYYY-MM-DD HH:MM:SS` in the local time zone.
+fn format_local_time(epoch_secs: i64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_opt(epoch_secs, 0).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        None => format!("epoch {}", epoch_secs),
     }
-    let days_in_months: [i64; 12] = if is_leap_year(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut month = 0usize;
-    for (i, &d) in days_in_months.iter().enumerate() {
-        if remaining_days < d {
-            month = i;
-            break;
-        }
-        remaining_days -= d;
-    }
-    let day = remaining_days + 1;
-
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        year,
-        month + 1,
-        day,
-        hours,
-        minutes,
-        seconds
-    )
-}
-
-fn is_leap_year(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -788,4 +825,44 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    #[test]
+    fn describe_http_error_anthropic_style() {
+        let body = r#"{ "error": { "type": "rate_limit_error", "message": "Rate limited. Please try again later." } }"#;
+        assert_eq!(
+            describe_http_error(429, body),
+            "HTTP 429: Rate limited. Please try again later."
+        );
+    }
+
+    #[test]
+    fn describe_http_error_invalid_grant_is_translated() {
+        let oauth = r#"{"error":"invalid_grant","error_description":"refresh token revoked"}"#;
+        let anthropic = r#"{"error":{"type":"invalid_grant","message":"x"}}"#;
+        for body in [oauth, anthropic] {
+            assert!(describe_http_error(400, body).starts_with("Refresh token 已失效"));
+        }
+    }
+
+    #[test]
+    fn describe_http_error_falls_back_to_raw_or_status() {
+        assert_eq!(describe_http_error(502, "<html>Bad Gateway</html>"), "HTTP 502: <html>Bad Gateway</html>");
+        assert_eq!(describe_http_error(503, "   "), "HTTP 503");
+    }
+
+    #[test]
+    fn parse_retry_after_seconds_only() {
+        let mut h = HeaderMap::new();
+        assert_eq!(parse_retry_after(&h), None);
+        h.insert(RETRY_AFTER, HeaderValue::from_static(" 7 "));
+        assert_eq!(parse_retry_after(&h), Some(7));
+        h.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        assert_eq!(parse_retry_after(&h), None);
+    }
 }

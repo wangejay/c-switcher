@@ -36,4 +36,6 @@ export interface OpResult {
   to?: string;
   expiresAt?: string;
   accessTokenPreview?: string;
+  /** Refresh was not needed (token still valid); no request was made. */
+  skipped?: boolean;
 }
