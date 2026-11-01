@@ -3,6 +3,7 @@ import type { ProfileEntry } from "../types";
 import {
   extractUsageBars,
   formatResetTime,
+  usageNotice,
   usageTone,
   type UsageBar,
   type UsageState,
@@ -249,9 +250,26 @@ function UsageStrip({ usage }: { usage?: UsageState }) {
   const bars = extractUsageBars(usage?.data);
   const stale = usage?.loading && bars.length > 0;
 
+  const notice = usageNotice(usage);
+
   let body: ReactNode;
   if (bars.length > 0) {
-    body = bars.map((b) => <UsageChip key={b.key} bar={b} />);
+    body = (
+      <>
+        {bars.map((b) => (
+          <UsageChip key={b.key} bar={b} />
+        ))}
+        {notice && !usage?.loading && (
+          <span
+            className="text-[12px] text-warning/90 truncate"
+            style={{ gridColumn: "1 / -1" }}
+            title={notice}
+          >
+            ⏸ {notice}
+          </span>
+        )}
+      </>
+    );
   } else if (usage?.loading) {
     body = (
       <span className="flex items-center gap-2 text-[13px] text-text3">
@@ -262,13 +280,17 @@ function UsageStrip({ usage }: { usage?: UsageState }) {
         Loading usage…
       </span>
     );
-  } else if (usage?.error) {
+  } else if (notice) {
     body = (
       <span
-        className="text-[13px] text-danger/80 truncate"
-        title={usage.error}
+        className={`text-[13px] truncate ${
+          usage?.blockedUntil && usage.blockedUntil > Date.now()
+            ? "text-warning/90"
+            : "text-danger/80"
+        }`}
+        title={notice}
       >
-        Usage unavailable · {usage.error}
+        Usage unavailable · {notice}
       </span>
     );
   } else {

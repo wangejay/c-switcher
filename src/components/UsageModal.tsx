@@ -5,6 +5,8 @@ interface Props {
   profileName: string;
   loading: boolean;
   error?: string;
+  /** Shown above the data, e.g. a rate-limit back-off over cached numbers. */
+  notice?: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   data?: any;
   onClose: () => void;
@@ -15,6 +17,7 @@ export default function UsageModal({
   profileName,
   loading,
   error,
+  notice,
   data,
   onClose,
 }: Props) {
@@ -59,6 +62,18 @@ export default function UsageModal({
           <div className="modal-body">
             <div className="rate-card text-danger text-[14px] ring-1 ring-danger/15 leading-relaxed" style={{ background: "rgba(248,113,113,0.08)" }}>
               {error}
+            </div>
+          </div>
+        )}
+
+        {/* Notice over cached data */}
+        {!error && data && notice && (
+          <div className="modal-body" style={{ paddingBottom: 0 }}>
+            <div
+              className="rate-card text-warning text-[13px] ring-1 ring-warning/20 leading-relaxed"
+              style={{ background: "rgba(251,191,36,0.08)" }}
+            >
+              {notice}
             </div>
           </div>
         )}

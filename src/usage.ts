@@ -2,7 +2,9 @@
  * Helpers for the OAuth usage API response (api.anthropic.com/api/oauth/usage).
  *
  * The usage endpoint is a read-only account query: calling it does not run a
- * model and does not count against the 5h / 7d limits.
+ * model and does not count against the 5h / 7d limits. It is rate limited per
+ * account, though, and Claude Code itself (/usage, status line) draws on the
+ * same allowance; a 429 locks the account out for minutes up to an hour.
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -21,6 +23,79 @@ export interface UsageState {
   error?: string;
   data?: any;
   fetchedAt?: number;
+  /** After a 429: no requests for this account until this time (ms). */
+  blockedUntil?: number;
+}
+
+/** Automatic re-queries (launch, focus, after actions) wait at least this long. */
+export const USAGE_AUTO_MIN_AGE_MS = 5 * 60_000;
+/** The Usage button may re-query sooner than the automatic refresh. */
+export const USAGE_MANUAL_MIN_AGE_MS = 60_000;
+/** Back-off after a 429 that carried no Retry-After header. */
+export const USAGE_DEFAULT_BACKOFF_MS = 5 * 60_000;
+
+const CACHE_KEY = "c-switcher.usage.v1";
+
+/** Last known usage per profile, so a restart neither blanks nor re-queries it. */
+export function loadUsageCache(): Record<string, UsageState> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(CACHE_KEY) ?? "{}");
+    const out: Record<string, UsageState> = {};
+    for (const [name, v] of Object.entries<any>(raw)) {
+      out[name] = {
+        loading: false,
+        data: v?.data,
+        fetchedAt: v?.fetchedAt,
+        blockedUntil: v?.blockedUntil,
+      };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function saveUsageCache(usage: Record<string, UsageState>) {
+  try {
+    const out: Record<string, Omit<UsageState, "loading" | "error">> = {};
+    for (const [name, v] of Object.entries(usage)) {
+      out[name] = {
+        data: v.data,
+        fetchedAt: v.fetchedAt,
+        blockedUntil: v.blockedUntil,
+      };
+    }
+    localStorage.setItem(CACHE_KEY, JSON.stringify(out));
+  } catch {
+    // Storage unavailable: the cache is only a convenience.
+  }
+}
+
+/** "45s", "21m", "1h 3m" — a duration in milliseconds. */
+export function formatDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+/**
+ * One-line status for a profile's usage when something is off: rate limited
+ * (with time left) or the last request failed. Undefined when all is well.
+ */
+export function usageNotice(state?: UsageState): string | undefined {
+  if (!state) return undefined;
+  const now = Date.now();
+  if (state.blockedUntil && state.blockedUntil > now) {
+    const age = state.fetchedAt
+      ? ` · showing data from ${formatDuration(now - state.fetchedAt)} ago`
+      : "";
+    return `Rate limited by Anthropic, retry in ${formatDuration(
+      state.blockedUntil - now
+    )}${age}`;
+  }
+  return state.error;
 }
 
 /** Label for one entry of the `limits[]` array. */
@@ -81,7 +156,7 @@ export function formatResetTime(isoStr: string): string {
     if (diffMs <= 0) return "now";
     const diffH = Math.floor(diffMs / 3600000);
     const diffM = Math.floor((diffMs % 3600000) / 60000);
-    if (diffH > 24) return `${Math.floor(diffH / 24)}d ${diffH % 24}h`;
+    if (diffH >= 24) return `${Math.floor(diffH / 24)}d ${diffH % 24}h`;
     if (diffH > 0) return `${diffH}h ${diffM}m`;
     return `${diffM}m`;
   } catch {

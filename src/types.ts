@@ -24,6 +24,8 @@ export interface ProfileEntry {
 export interface UsageResult {
   success: boolean;
   error?: string;
+  /** On HTTP 429: seconds the server asked us to wait. */
+  retryAfterSecs?: number;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   data?: any;
 }

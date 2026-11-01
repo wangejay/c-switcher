@@ -720,7 +720,7 @@ async fn refresh_token(profile_name: Option<String>, force: Option<bool>) -> OpR
     refresh_token_impl(profile_name, force.unwrap_or(false)).await
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageResult {
     pub success: bool,
@@ -728,6 +728,10 @@ pub struct UsageResult {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// On HTTP 429: seconds the server asked us to wait (Retry-After). The
+    /// usage endpoint's lockouts run from minutes to about an hour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
 }
 
 /// Helper: extract access token from a keychain token JSON string
@@ -751,6 +755,7 @@ pub async fn get_usage_impl(profile_name: Option<String>) -> UsageResult {
                 success: false,
                 error: Some(format!("Profile '{}' 不存在", pname)),
                 data: None,
+                ..Default::default()
             };
         }
         match std::fs::read_to_string(&path)
@@ -764,6 +769,7 @@ pub async fn get_usage_impl(profile_name: Option<String>) -> UsageResult {
                     success: false,
                     error: Some(e),
                     data: None,
+                    ..Default::default()
                 }
             }
         }
@@ -775,6 +781,7 @@ pub async fn get_usage_impl(profile_name: Option<String>) -> UsageResult {
                     success: false,
                     error: Some(e),
                     data: None,
+                    ..Default::default()
                 }
             }
         }
@@ -788,6 +795,7 @@ pub async fn get_usage_impl(profile_name: Option<String>) -> UsageResult {
                 success: false,
                 error: Some(e),
                 data: None,
+                ..Default::default()
             }
         }
     };
@@ -807,17 +815,24 @@ pub async fn get_usage_impl(profile_name: Option<String>) -> UsageResult {
                 success: false,
                 error: Some(format!("HTTP error: {}", e)),
                 data: None,
+                ..Default::default()
             }
         }
     };
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
+        let retry_after_secs = if status == 429 {
+            parse_retry_after(resp.headers())
+        } else {
+            None
+        };
         let body_text = resp.text().await.unwrap_or_default();
         return UsageResult {
             success: false,
             error: Some(describe_http_error(status, &body_text)),
             data: None,
+            retry_after_secs,
         };
     }
 
@@ -826,11 +841,13 @@ pub async fn get_usage_impl(profile_name: Option<String>) -> UsageResult {
             success: true,
             error: None,
             data: Some(data),
+            ..Default::default()
         },
         Err(e) => UsageResult {
             success: false,
             error: Some(format!("Parse response: {}", e)),
             data: None,
+            ..Default::default()
         },
     }
 }

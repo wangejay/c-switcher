@@ -7,7 +7,15 @@ import {
 } from "react";
 import type { CurrentInfo, ProfileEntry } from "./types";
 import type { ToastItem, ToastType } from "./components/Toast";
-import type { UsageState } from "./usage";
+import {
+  loadUsageCache,
+  saveUsageCache,
+  usageNotice,
+  USAGE_AUTO_MIN_AGE_MS,
+  USAGE_DEFAULT_BACKOFF_MS,
+  USAGE_MANUAL_MIN_AGE_MS,
+  type UsageState,
+} from "./usage";
 import {
   getCurrentInfo,
   listProfiles,
@@ -46,15 +54,15 @@ function currentProfileName(
 export default function App() {
   const [info, setInfo] = useState<CurrentInfo | null>(null);
   const [profiles, setProfiles] = useState<ProfileEntry[]>([]);
-  const [usage, setUsage] = useState<Record<string, UsageState>>({});
+  const [usage, setUsageState] = useState<Record<string, UsageState>>(
+    loadUsageCache
+  );
+  // Mirror of `usage` for async code that must see the latest value.
+  const usageRef = useRef(usage);
   const lastUsageFetch = useRef(0);
   const [showAddModal, setShowAddModal] = useState(false);
   const [confirmTarget, setConfirmTarget] = useState<string | null>(null);
   const [usageTarget, setUsageTarget] = useState<string | null>(null);
-  const [usageLoading, setUsageLoading] = useState(false);
-  const [usageError, setUsageError] = useState<string | undefined>();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const [usageData, setUsageData] = useState<any>(undefined);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set());
   const listRef = useRef<HTMLDivElement>(null);
@@ -70,13 +78,38 @@ export default function App() {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
+  const setUsage = useCallback(
+    (
+      update: (
+        prev: Record<string, UsageState>
+      ) => Record<string, UsageState>
+    ) => {
+      const next = update(usageRef.current);
+      usageRef.current = next;
+      saveUsageCache(next);
+      setUsageState(next);
+    },
+    []
+  );
+
   /**
-   * Fetch one profile's usage. The usage endpoint is a read-only account
-   * query: it runs no model and costs no tokens. Returns true if the
+   * Fetch one profile's usage, unless the cached copy is younger than
+   * `minAgeMs` or the account is still in a 429 back-off. The usage endpoint
+   * costs no tokens but is tightly rate limited. Returns true if the
    * profile's token had to be refreshed first.
    */
   const loadUsageFor = useCallback(
-    async (p: ProfileEntry, isCurrent: boolean): Promise<boolean> => {
+    async (
+      p: ProfileEntry,
+      isCurrent: boolean,
+      minAgeMs = USAGE_AUTO_MIN_AGE_MS
+    ): Promise<boolean> => {
+      const cached = usageRef.current[p.name];
+      const now = Date.now();
+      if (cached?.loading) return false;
+      if (cached?.blockedUntil && cached.blockedUntil > now) return false;
+      if (cached?.fetchedAt && now - cached.fetchedAt < minAgeMs) return false;
+
       setUsage((prev) => ({
         ...prev,
         [p.name]: { ...prev[p.name], loading: true },
@@ -93,6 +126,10 @@ export default function App() {
       // The active profile reads the live keychain token, which Claude Code
       // keeps fresh; the profile file's copy may be stale.
       const result = await getUsage(isCurrent ? null : p.name);
+      const rateLimited =
+        !result.success &&
+        (result.retryAfterSecs !== undefined ||
+          /^HTTP 429\b/.test(result.error ?? ""));
       setUsage((prev) => ({
         ...prev,
         [p.name]: result.success
@@ -102,11 +139,17 @@ export default function App() {
               error: result.error || "Failed to fetch usage",
               data: prev[p.name]?.data,
               fetchedAt: prev[p.name]?.fetchedAt,
+              blockedUntil: rateLimited
+                ? Date.now() +
+                  (result.retryAfterSecs !== undefined
+                    ? result.retryAfterSecs * 1000
+                    : USAGE_DEFAULT_BACKOFF_MS)
+                : undefined,
             },
       }));
       return refreshed;
     },
-    []
+    [setUsage]
   );
 
   /** Fetch usage for every profile in parallel. */
@@ -217,29 +260,14 @@ export default function App() {
   };
 
   const handleUsage = async (profileName: string) => {
-    // Show what the row already has, then refresh it in the background.
-    const cached = usage[profileName]?.data;
+    // Show what the row already has; re-query only if it is over a minute
+    // old and the account is not in a rate-limit back-off.
     setUsageTarget(profileName);
-    setUsageLoading(!cached);
-    setUsageError(undefined);
-    setUsageData(cached);
+    const p = profiles.find((x) => x.name === profileName);
+    if (!p) return;
     const isCurrent =
       profileName === currentProfileName(profiles, info?.email);
-    const result = await getUsage(isCurrent ? null : profileName);
-    setUsageLoading(false);
-    if (result.success) {
-      setUsageData(result.data);
-      setUsage((prev) => ({
-        ...prev,
-        [profileName]: {
-          loading: false,
-          data: result.data,
-          fetchedAt: Date.now(),
-        },
-      }));
-    } else {
-      setUsageError(result.error || "Failed to fetch usage");
-    }
+    await loadUsageFor(p, isCurrent, USAGE_MANUAL_MIN_AGE_MS);
   };
 
   const handleReload = () => {
@@ -248,6 +276,7 @@ export default function App() {
   };
 
   const current = currentProfileName(profiles, info?.email);
+  const target = usageTarget ? usage[usageTarget] : undefined;
   // The active account always sits on top; the rest keep their file order.
   const ordered = current
     ? [
@@ -358,9 +387,10 @@ export default function App() {
       <UsageModal
         open={!!usageTarget}
         profileName={usageTarget ?? ""}
-        loading={usageLoading}
-        error={usageError}
-        data={usageData}
+        loading={!!target?.loading && !target?.data}
+        error={target?.data ? undefined : usageNotice(target)}
+        notice={target?.data ? usageNotice(target) : undefined}
+        data={target?.data}
         onClose={() => setUsageTarget(null)}
       />
 
