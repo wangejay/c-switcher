@@ -325,7 +325,67 @@ async fn get_current_info() -> CurrentInfo {
     }
 }
 
+/// `expiresAt` (ms) of a stored keychain token JSON; 0 if unreadable.
+fn token_expires_at(token: &str) -> i64 {
+    serde_json::from_str::<serde_json::Value>(token)
+        .ok()
+        .and_then(|v| v.get("claudeAiOauth")?.get("expiresAt")?.as_i64())
+        .unwrap_or(0)
+}
+
+/// Copy the live keychain token back into the profile file of the account
+/// Claude Code is signed in with. Claude Code rotates the refresh token every
+/// time it refreshes, which revokes the copy saved at backup time; without
+/// this, a profile switched away from is left holding a dead token.
+/// Returns the names of the profiles that were updated.
+pub async fn sync_active_profile() -> Result<Vec<String>, String> {
+    // Nobody signed in (or no keychain entry yet): nothing to save.
+    let Ok(current) = read_oauth_account() else {
+        return Ok(vec![]);
+    };
+    if current.email_address.is_empty() {
+        return Ok(vec![]);
+    }
+    let Ok(live) = get_keychain_token().await else {
+        return Ok(vec![]);
+    };
+    let live_expires = token_expires_at(&live);
+
+    let mut synced = vec![];
+    let rd = match std::fs::read_dir(profiles_dir()) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(synced),
+    };
+    for path in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
+        if path.extension().map(|e| e != "json").unwrap_or(true) {
+            continue;
+        }
+        let Ok(mut pf) = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str::<ProfileFile>(&s).map_err(|e| e.to_string()))
+        else {
+            continue;
+        };
+        if pf.oauth_account.email_address != current.email_address
+            || pf.oauth_account.account_uuid != current.account_uuid
+            || pf.keychain_token == live
+            // Never replace a newer token (e.g. one refreshed by this app).
+            || token_expires_at(&pf.keychain_token) > live_expires
+        {
+            continue;
+        }
+        pf.keychain_token = live.clone();
+        let json = serde_json::to_string_pretty(&pf).map_err(|e| e.to_string())?;
+        std::fs::write(&path, format!("{}\n", json))
+            .map_err(|e| format!("Write profile: {}", e))?;
+        synced.push(pf.name);
+    }
+    Ok(synced)
+}
+
 pub async fn list_profiles_impl() -> Vec<ProfileEntry> {
+    // Keep the active account's profile in step with Claude Code's token.
+    let _ = sync_active_profile().await;
     let dir = profiles_dir();
     if !dir.exists() {
         return vec![];
@@ -442,6 +502,11 @@ pub async fn switch_profile_impl(name: String) -> OpResult {
     let path = profiles_dir().join(format!("{}.json", name));
     if !path.exists() {
         return OpResult::err(&format!("Profile '{}' 不存在", name));
+    }
+    // Save the outgoing account's latest token before the keychain is
+    // overwritten; it is the only valid copy once Claude Code has rotated it.
+    if let Err(e) = sync_active_profile().await {
+        return OpResult::err(&format!("Cannot save current account's token: {}", e));
     }
     let pf: ProfileFile = match std::fs::read_to_string(&path)
         .map_err(|e| e.to_string())

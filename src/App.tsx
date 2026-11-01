@@ -121,6 +121,18 @@ export default function App() {
       if (p.isExpired && !isCurrent) {
         const r = await refreshToken(p.name);
         refreshed = r.success && !r.skipped;
+        if (!r.success) {
+          // The usage call would only fail with a vaguer 401; say why instead.
+          setUsage((prev) => ({
+            ...prev,
+            [p.name]: {
+              ...prev[p.name],
+              loading: false,
+              error: r.error || "Token refresh failed",
+            },
+          }));
+          return false;
+        }
       }
 
       // The active profile reads the live keychain token, which Claude Code
