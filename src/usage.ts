@@ -25,6 +25,11 @@ export interface UsageState {
   fetchedAt?: number;
   /** After a 429: no requests for this account until this time (ms). */
   blockedUntil?: number;
+  /**
+   * After an automatic token refresh failed: don't retry it automatically
+   * until this time (ms). Not persisted, so a restart tries once more.
+   */
+  pausedUntil?: number;
 }
 
 /** Automatic re-queries (launch, focus, after actions) wait at least this long. */
@@ -33,6 +38,12 @@ export const USAGE_AUTO_MIN_AGE_MS = 5 * 60_000;
 export const USAGE_MANUAL_MIN_AGE_MS = 60_000;
 /** Back-off after a 429 that carried no Retry-After header. */
 export const USAGE_DEFAULT_BACKOFF_MS = 5 * 60_000;
+/**
+ * Back-off after an automatic token refresh fails. The token endpoint sends
+ * no Retry-After, and retrying on every focus only prolongs a 429.
+ */
+export const REFRESH_RATE_LIMIT_BACKOFF_MS = 10 * 60_000;
+export const REFRESH_FAILURE_BACKOFF_MS = 60 * 60_000;
 
 const CACHE_KEY = "c-switcher.usage.v1";
 
@@ -94,6 +105,11 @@ export function usageNotice(state?: UsageState): string | undefined {
     return `Rate limited by Anthropic, retry in ${formatDuration(
       state.blockedUntil - now
     )}${age}`;
+  }
+  if (state.error && state.pausedUntil && state.pausedUntil > now) {
+    return `${state.error} · auto retry in ${formatDuration(
+      state.pausedUntil - now
+    )} (or click Refresh)`;
   }
   return state.error;
 }

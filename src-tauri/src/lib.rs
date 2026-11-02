@@ -7,7 +7,11 @@ use tokio::time::{sleep, Duration};
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+/// Same endpoint Claude Code uses; the old console.anthropic.com host keeps
+/// answering refreshes with HTTP 429.
+/// User-Agent for calls to Anthropic's OAuth endpoints (see post_token_refresh).
+const REFRESH_USER_AGENT: &str = "axios/1.9.0";
+const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 /// Skip a non-forced refresh while the token still has at least this long to live.
 const REFRESH_SKIP_MARGIN_MS: u64 = 5 * 60 * 1000;
 /// Attempts against the token endpoint before giving up on HTTP 429.
@@ -568,20 +572,30 @@ async fn delete_profile(name: String) -> OpResult {
 
 /// POST a refresh_token grant to the OAuth token endpoint.
 /// Retries with backoff on HTTP 429, honouring Retry-After when it is short.
-async fn post_token_refresh(refresh_tok: &str) -> Result<serde_json::Value, String> {
+async fn post_token_refresh(
+    refresh_tok: &str,
+    scopes: &[String],
+) -> Result<serde_json::Value, String> {
     let client = reqwest::Client::new();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_tok,
         "client_id": OAUTH_CLIENT_ID,
     });
+    // Like Claude Code, ask for the scopes the token already has.
+    if !scopes.is_empty() {
+        body["scope"] = serde_json::Value::String(scopes.join(" "));
+    }
 
     let mut attempt: u32 = 1;
     loop {
         let resp = client
             .post(OAUTH_TOKEN_URL)
             .header("Content-Type", "application/json")
-            .header("User-Agent", "claude-code/2.1.0")
+            // Claude Code sends axios' default User-Agent here. Requests
+            // claiming to be "claude-code/x.y.z" are answered with HTTP 429
+            // regardless of how rarely they are made.
+            .header("User-Agent", REFRESH_USER_AGENT)
             .json(&body)
             .send()
             .await
@@ -705,7 +719,18 @@ pub async fn refresh_token_impl(profile_name: Option<String>, force: bool) -> Op
         }
     }
 
-    let resp_data = match post_token_refresh(&refresh_tok).await {
+    let scopes: Vec<String> = token_json
+        .get("claudeAiOauth")
+        .and_then(|o| o.get("scopes"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let resp_data = match post_token_refresh(&refresh_tok, &scopes).await {
         Ok(v) => v,
         Err(e) => return OpResult::err(&e),
     };
@@ -871,6 +896,7 @@ pub async fn get_usage_impl(profile_name: Option<String>) -> UsageResult {
         .get("https://api.anthropic.com/api/oauth/usage")
         .header("Authorization", format!("Bearer {}", access_token))
         .header("anthropic-beta", "oauth-2025-04-20")
+        .header("User-Agent", REFRESH_USER_AGENT)
         .send()
         .await
     {

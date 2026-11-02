@@ -284,7 +284,8 @@ function UsageStrip({ usage }: { usage?: UsageState }) {
     body = (
       <span
         className={`text-[13px] truncate ${
-          usage?.blockedUntil && usage.blockedUntil > Date.now()
+          (usage?.blockedUntil ?? 0) > Date.now() ||
+          (usage?.pausedUntil ?? 0) > Date.now()
             ? "text-warning/90"
             : "text-danger/80"
         }`}

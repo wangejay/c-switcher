@@ -14,6 +14,8 @@ import {
   USAGE_AUTO_MIN_AGE_MS,
   USAGE_DEFAULT_BACKOFF_MS,
   USAGE_MANUAL_MIN_AGE_MS,
+  REFRESH_FAILURE_BACKOFF_MS,
+  REFRESH_RATE_LIMIT_BACKOFF_MS,
   type UsageState,
 } from "./usage";
 import {
@@ -108,6 +110,7 @@ export default function App() {
       const now = Date.now();
       if (cached?.loading) return false;
       if (cached?.blockedUntil && cached.blockedUntil > now) return false;
+      if (cached?.pausedUntil && cached.pausedUntil > now) return false;
       if (cached?.fetchedAt && now - cached.fetchedAt < minAgeMs) return false;
 
       setUsage((prev) => ({
@@ -122,13 +125,20 @@ export default function App() {
         const r = await refreshToken(p.name);
         refreshed = r.success && !r.skipped;
         if (!r.success) {
-          // The usage call would only fail with a vaguer 401; say why instead.
+          // The usage call would only fail with a vaguer 401; say why instead,
+          // and leave the token endpoint alone for a while.
+          const rateLimited = /HTTP 429/.test(r.error ?? "");
           setUsage((prev) => ({
             ...prev,
             [p.name]: {
               ...prev[p.name],
               loading: false,
-              error: r.error || "Token refresh failed",
+              error: `Token refresh failed: ${r.error || "unknown error"}`,
+              pausedUntil:
+                Date.now() +
+                (rateLimited
+                  ? REFRESH_RATE_LIMIT_BACKOFF_MS
+                  : REFRESH_FAILURE_BACKOFF_MS),
             },
           }));
           return false;
@@ -240,6 +250,17 @@ export default function App() {
         );
       } else if (result.success) {
         toast(`Token refreshed! Expires: ${result.expiresAt}`, "success");
+        // A working token again: let usage be queried right away.
+        setUsage((prev) => ({
+          ...prev,
+          [profileName]: {
+            ...prev[profileName],
+            loading: false,
+            error: undefined,
+            pausedUntil: undefined,
+            fetchedAt: undefined,
+          },
+        }));
         reloadAll();
       } else {
         toast(result.error || "Refresh failed", "error");
