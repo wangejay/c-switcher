@@ -1,6 +1,6 @@
 [package]
 name = "c-switcher"
-version = "1.0.4"
+version = "1.0.5"
 description = "Claude Code Auth Token Switcher"
 authors = ["wangejay"]
 edition = "2021"
@@ -18,10 +18,12 @@ path = "src/bin/csw.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tokio = { version = "1", features = ["process", "rt-multi-thread", "macros", "time"] }
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tauri-plugin-autostart = "~2.5"
+tauri-plugin-single-instance = "~2.3"

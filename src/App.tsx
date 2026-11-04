@@ -16,6 +16,8 @@ import {
   USAGE_MANUAL_MIN_AGE_MS,
   REFRESH_FAILURE_BACKOFF_MS,
   REFRESH_RATE_LIMIT_BACKOFF_MS,
+  peakUsage,
+  trayLabel,
   type UsageState,
 } from "./usage";
 import {
@@ -26,7 +28,9 @@ import {
   deleteProfile,
   refreshToken,
   getUsage,
+  updateTray,
 } from "./api";
+import { listen } from "@tauri-apps/api/event";
 import TopBar from "./components/TopBar";
 import ProfileRow from "./components/ProfileRow";
 import AddModal from "./components/AddModal";
@@ -39,6 +43,11 @@ let toastId = 0;
 
 /** Re-query usage when the window regains focus, at most this often. */
 const USAGE_FOCUS_THROTTLE_MS = 30_000;
+/**
+ * Keep the menu bar numbers current while the window is hidden. Each account
+ * is still queried at most every USAGE_AUTO_MIN_AGE_MS.
+ */
+const USAGE_POLL_MS = 5 * 60_000;
 
 /** Card reorder animation (FLIP) when the active account moves to the top. */
 const REORDER_MS = 600;
@@ -176,11 +185,15 @@ export default function App() {
 
   /** Fetch usage for every profile in parallel. */
   const loadAllUsage = useCallback(
-    async (list: ProfileEntry[], currentEmail?: string) => {
+    async (
+      list: ProfileEntry[],
+      currentEmail?: string,
+      minAgeMs = USAGE_AUTO_MIN_AGE_MS
+    ) => {
       lastUsageFetch.current = Date.now();
       const current = currentProfileName(list, currentEmail);
       const refreshed = await Promise.all(
-        list.map((p) => loadUsageFor(p, p.name === current))
+        list.map((p) => loadUsageFor(p, p.name === current, minAgeMs))
       );
       // A token was rotated: re-list so the status dots catch up.
       if (refreshed.some(Boolean)) setProfiles(await listProfiles());
@@ -189,28 +202,45 @@ export default function App() {
   );
 
   /** Reload the active account, the profile list and every profile's usage. */
-  const reloadAll = useCallback(async () => {
-    const [inf, list] = await Promise.all([getCurrentInfo(), listProfiles()]);
-    setInfo(inf);
-    setProfiles(list);
-    await loadAllUsage(list, inf.email);
-  }, [loadAllUsage]);
+  const reloadAll = useCallback(
+    async (minAgeMs = USAGE_AUTO_MIN_AGE_MS) => {
+      const [inf, list] = await Promise.all([
+        getCurrentInfo(),
+        listProfiles(),
+      ]);
+      setInfo(inf);
+      setProfiles(list);
+      await loadAllUsage(list, inf.email, minAgeMs);
+    },
+    [loadAllUsage]
+  );
 
   useEffect(() => {
     reloadAll();
   }, [reloadAll]);
 
-  // Usage is only re-queried on focus (throttled) and after actions; there is
-  // no background polling.
+  // Usage is re-queried on focus or when the menu bar menu opens (throttled),
+  // after actions, and every few minutes for the menu bar. Per-account
+  // minimum ages and 429 back-offs in loadUsageFor keep the request count low.
+  useEffect(() => {
+    const id = window.setInterval(() => reloadAll(), USAGE_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [reloadAll]);
+
   useEffect(() => {
     const onFocus = () => {
       if (document.visibilityState === "hidden") return;
       if (Date.now() - lastUsageFetch.current < USAGE_FOCUS_THROTTLE_MS) return;
       reloadAll();
     };
+    const unlisten = listen("tray-opened", () => {
+      if (Date.now() - lastUsageFetch.current < USAGE_FOCUS_THROTTLE_MS) return;
+      reloadAll();
+    });
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onFocus);
     return () => {
+      unlisten.then((f) => f());
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };
@@ -303,12 +333,43 @@ export default function App() {
     await loadUsageFor(p, isCurrent, USAGE_MANUAL_MIN_AGE_MS);
   };
 
+  // Menu bar actions. The listeners are registered once and call the latest
+  // handlers through refs.
+  const trayHandlers = useRef({ switchTo: handleSwitch, refresh: () => {} });
+  trayHandlers.current = {
+    switchTo: handleSwitch,
+    refresh: () => reloadAll(USAGE_MANUAL_MIN_AGE_MS),
+  };
+  const [trayTick, setTrayTick] = useState(0);
+  useEffect(() => {
+    const offSwitch = listen<string>("tray-switch", (e) => {
+      if (e.payload === currentRef.current) {
+        // Clicking the active account toggled its check mark; restore it.
+        setTrayTick((n) => n + 1);
+        return;
+      }
+      trayHandlers.current.switchTo(e.payload);
+    });
+    const offRefresh = listen("tray-refresh", () =>
+      trayHandlers.current.refresh()
+    );
+    // A tray setting changed (e.g. Launch at Login): rebuild the menu.
+    const offChanged = listen("tray-changed", () => setTrayTick((n) => n + 1));
+    return () => {
+      offSwitch.then((f) => f());
+      offRefresh.then((f) => f());
+      offChanged.then((f) => f());
+    };
+  }, []);
+
   const handleReload = () => {
     reloadAll();
     toast("Reloaded!", "success");
   };
 
   const current = currentProfileName(profiles, info?.email);
+  const currentRef = useRef(current);
+  currentRef.current = current;
   const target = usageTarget ? usage[usageTarget] : undefined;
   // The active account always sits on top; the rest keep their file order.
   const ordered = current
@@ -318,6 +379,24 @@ export default function App() {
       ]
     : profiles;
   const orderKey = ordered.map((p) => p.name).join("\n");
+
+  // Mirror the list into the menu bar: the active account's peak usage next
+  // to the icon, every account (click to switch) in the menu.
+  useEffect(() => {
+    const peak = peakUsage(current ? usage[current] : undefined);
+    updateTray({
+      title: current ? `${current}${peak !== undefined ? ` ${peak}%` : ""}` : "",
+      tooltip: current ? `C-Switcher · Active: ${current}` : "C-Switcher",
+      profiles: ordered.map((p) => ({
+        name: p.name,
+        label: trayLabel(p.name, usage[p.name]),
+        active: p.name === current,
+      })),
+    }).catch(() => {
+      // No tray (e.g. unsupported desktop): nothing to mirror.
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orderKey, current, usage, trayTick]);
 
   // FLIP: when the order changes, start each card at its old position and
   // glide it to the new one. Positions are recorded after every render so

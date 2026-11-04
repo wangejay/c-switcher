@@ -164,6 +164,28 @@ export function extractUsageBars(data: any): UsageBar[] {
     }));
 }
 
+/**
+ * Menu bar view of the accounts: one menu label per profile and, for the
+ * active one, a short title shown next to the menu bar icon.
+ */
+export function trayLabel(name: string, state?: UsageState): string {
+  const bars = extractUsageBars(state?.data);
+  const parts = bars.map((b) => `${b.label} ${b.pct}%`);
+  if (parts.length === 0) {
+    parts.push(state?.loading ? "loading…" : "no usage data");
+  }
+  const now = Date.now();
+  if ((state?.blockedUntil ?? 0) > now) parts.push("rate limited");
+  else if ((state?.pausedUntil ?? 0) > now) parts.push("refresh failed");
+  return `${name}    ${parts.join(" · ")}`;
+}
+
+/** Highest usage across an account's limits: the one that runs out first. */
+export function peakUsage(state?: UsageState): number | undefined {
+  const bars = extractUsageBars(state?.data);
+  return bars.length ? Math.max(...bars.map((b) => b.pct)) : undefined;
+}
+
 /** "1h 12m", "2d 5h", "now" — time until an ISO timestamp. */
 export function formatResetTime(isoStr: string): string {
   try {

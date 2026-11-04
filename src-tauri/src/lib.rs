@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::image::Image;
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent, Wry};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+#[cfg(target_os = "macos")]
+use tauri::{ActivationPolicy, RunEvent};
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
@@ -957,9 +964,175 @@ fn format_local_time(epoch_secs: i64) -> String {
     }
 }
 
+// ── Menu bar (tray) ──
+
+const TRAY_ID: &str = "main";
+/// Passed by the login item: start in the menu bar without opening the window.
+const HIDDEN_ARG: &str = "--hidden";
+
+/// One account row in the tray menu; the frontend formats the label.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrayProfile {
+    name: String,
+    label: String,
+    active: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrayState {
+    /// Text next to the menu bar icon (macOS), e.g. "Sean 97%".
+    title: String,
+    tooltip: String,
+    profiles: Vec<TrayProfile>,
+}
+
+fn build_tray_menu(app: &AppHandle, profiles: &[TrayProfile]) -> tauri::Result<Menu<Wry>> {
+    let menu = Menu::new(app)?;
+    if profiles.is_empty() {
+        menu.append(&MenuItem::with_id(app, "none", "No profiles yet", false, None::<&str>)?)?;
+    }
+    for p in profiles {
+        // Clicking an account switches to it; the active one carries the check.
+        menu.append(&CheckMenuItem::with_id(
+            app,
+            format!("switch:{}", p.name),
+            &p.label,
+            true,
+            p.active,
+            None::<&str>,
+        )?)?;
+    }
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&MenuItem::with_id(app, "refresh", "Refresh Usage", true, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(app, "open", "Open C-Switcher", true, None::<&str>)?)?;
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    let at_login = app.autolaunch().is_enabled().unwrap_or(false);
+    menu.append(&CheckMenuItem::with_id(
+        app,
+        "autostart",
+        "Launch at Login",
+        true,
+        at_login,
+        None::<&str>,
+    )?)?;
+    menu.append(&MenuItem::with_id(app, "quit", "Quit C-Switcher", true, None::<&str>)?)?;
+    Ok(menu)
+}
+
+/// Rebuild the tray menu and title from the frontend's current view.
+/// Sync command, so it runs on the main thread as menu updates require.
+#[tauri::command]
+fn update_tray(app: AppHandle, state: TrayState) -> Result<(), String> {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return Ok(());
+    };
+    let menu = build_tray_menu(&app, &state.profiles).map_err(|e| e.to_string())?;
+    tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
+    tray.set_title(Some(state.title.as_str()))
+        .map_err(|e| e.to_string())?;
+    tray.set_tooltip(Some(state.tooltip.as_str()))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Show the window and, on macOS, the Dock icon that goes with it.
+fn show_main_window(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(ActivationPolicy::Regular);
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// Hide the window and, on macOS, the Dock icon: only the menu bar item stays.
+fn hide_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(ActivationPolicy::Accessory);
+}
+
+fn toggle_autostart(app: &AppHandle) {
+    let launcher = app.autolaunch();
+    let _ = if launcher.is_enabled().unwrap_or(false) {
+        launcher.disable()
+    } else {
+        launcher.enable()
+    };
+    // Rebuild the menu so the check mark matches the real setting.
+    let _ = app.emit("tray-changed", ());
+}
+
+
+fn create_tray(app: &AppHandle) -> tauri::Result<()> {
+    TrayIconBuilder::with_id(TRAY_ID)
+        .icon(Image::from_bytes(include_bytes!("../icons/tray.png"))?)
+        .icon_as_template(true)
+        .tooltip("C-Switcher")
+        .menu(&build_tray_menu(app, &[])?)
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "quit" => app.exit(0),
+            "open" => show_main_window(app),
+            "autostart" => toggle_autostart(app),
+            "refresh" => {
+                let _ = app.emit("tray-refresh", ());
+            }
+            id => {
+                if let Some(name) = id.strip_prefix("switch:") {
+                    let _ = app.emit("tray-switch", name.to_string());
+                }
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            // Opening the menu is a good moment to bring usage up to date.
+            if let TrayIconEvent::Click { .. } = event {
+                let _ = tray.app_handle().emit("tray-opened", ());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        // Must come first: a second launch (Dock, Finder, a stray login item)
+        // just brings up the running instance instead of adding a second
+        // menu bar icon.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !args.iter().any(|a| a == HIDDEN_ARG) {
+                show_main_window(app);
+            }
+        }))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec![HIDDEN_ARG]),
+        ))
+        .setup(|app| {
+            create_tray(app.handle())?;
+            // The window starts hidden (tauri.conf.json); open it unless this
+            // is a login launch.
+            if std::env::args().any(|a| a == HIDDEN_ARG) {
+                hide_main_window(app.handle());
+            } else {
+                show_main_window(app.handle());
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Closing the window keeps the app in the menu bar; Quit is in
+            // the tray menu (and Cmd+Q while the window is open).
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                hide_main_window(window.app_handle());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_current_info,
             list_profiles,
@@ -968,9 +1141,24 @@ pub fn run() {
             delete_profile,
             refresh_token,
             get_usage,
+            update_tray,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app, event| {
+        // Dock icon clicked while the window is hidden: bring it back.
+        #[cfg(target_os = "macos")]
+        if let RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } = event
+        {
+            show_main_window(app);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (app, event);
+    });
 }
 
 #[cfg(test)]

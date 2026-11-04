@@ -33,3 +33,13 @@ export async function getUsage(
 ): Promise<UsageResult> {
   return invoke("get_usage", { profileName: profileName ?? null });
 }
+
+export interface TrayState {
+  title: string;
+  tooltip: string;
+  profiles: { name: string; label: string; active: boolean }[];
+}
+
+export async function updateTray(state: TrayState): Promise<void> {
+  return invoke("update_tray", { state });
+}
